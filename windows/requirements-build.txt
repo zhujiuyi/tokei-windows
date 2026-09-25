@@ -1,0 +1,7 @@
+-e .
+PySide6==6.11.2
+keyring==25.7.0
+psutil==7.2.2
+Nuitka==4.2.2
+ordered-set==4.1.0
+zstandard==0.25.0

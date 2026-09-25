@@ -1,0 +1,46 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Create build environment
+        working-directory: windows
+        run: python -m venv .venv
+      - name: Install application and build dependencies
+        working-directory: windows
+        run: .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+      - name: Run Windows client tests
+        working-directory: windows
+        run: .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+      - name: Validate QML
+        working-directory: windows
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem tokei_windows\qml\*.qml | ForEach-Object { $_.FullName }
+          & .\.venv\Scripts\pyside6-qmllint.exe @files
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build single-file application
+        working-directory: windows
+        shell: pwsh
+        run: .\build.ps1
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tokei-Windows-x64
+          path: windows/dist/Tokei-Windows.exe
+          if-no-files-found: error
