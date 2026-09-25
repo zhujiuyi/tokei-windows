@@ -56,6 +56,15 @@ $candidate = Get-ChildItem -LiteralPath (Join-Path $stagingDirectory "deployment
 if (-not $candidate) { throw "run_app.exe was not produced by pyside6-deploy" }
 $destination = Join-Path $scriptDirectory "dist\Tokei-Windows.exe"
 New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
-if ($candidate.FullName -ne $destination) { Copy-Item -LiteralPath $candidate.FullName -Destination $destination -Force }
+if ($candidate.FullName -ne $destination) {
+    try {
+        Copy-Item -LiteralPath $candidate.FullName -Destination $destination -Force
+    } catch {
+        $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        $destination = Join-Path $scriptDirectory "dist\Tokei-Windows-update-$timestamp.exe"
+        Copy-Item -LiteralPath $candidate.FullName -Destination $destination
+        Write-Warning "The default EXE is in use; the new build was saved alongside it."
+    }
+}
 Get-FileHash -LiteralPath $destination -Algorithm SHA256 | Format-List
 Write-Output "Built: $destination"

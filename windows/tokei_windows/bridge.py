@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,55 @@ def _number(value: Any) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _integer(value: Any) -> int:
+    try:
+        return int(Decimal(str(value or 0)).to_integral_value(rounding=ROUND_HALF_UP))
+    except (InvalidOperation, TypeError, ValueError):
+        return 0
+
+
+def _format_integer(value: Any) -> str:
+    return f"{_integer(value):,}"
+
+
+def _normalize_refresh_seconds(value: Any) -> int:
+    try:
+        return min(300, max(60, int(value)))
+    except (TypeError, ValueError):
+        return 60
+
+
+def _qml_safe(value: Any) -> Any:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and abs(value) > 9_007_199_254_740_991:
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _qml_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_qml_safe(item) for item in value]
+    return value
+
+
+def _top_tools(snapshot: dict[str, Any], limit: int = 3) -> list[dict[str, Any]]:
+    tools = []
+    for key, title, color in PROVIDERS:
+        provider = snapshot.get(key)
+        ranges = provider.get("ranges") if isinstance(provider, dict) else None
+        today = (ranges or {}).get("today") or {}
+        tokens = sum(_integer(today.get(field)) for field in ("in", "out", "cached", "cr", "cw", "reason"))
+        if tokens <= 0:
+            continue
+        tools.append({
+            "key": key,
+            "title": title,
+            "tint": color,
+            "tokens": tokens,
+            "tokens_display": _format_integer(tokens),
+        })
+    return sorted(tools, key=lambda item: (-item["tokens"], item["title"]))[:limit]
 
 
 def _format_number(value: Any) -> str:
@@ -156,11 +206,20 @@ class _RefreshJob(QRunnable):
             )
             for day in dashboard.get("daily", []):
                 day["total_cost"] = sum(_number(day.get(field)) for field in cost_fields)
+                day["tokens_display"] = _format_integer(day.get("tokens", 0))
+                day["date_label"] = str(day.get("date", ""))[5:]
+            for model in dashboard.get("models", []):
+                model["tokens_display"] = _format_integer(model.get("tokens", 0))
             result: dict[str, Any] = {"usage": usage, "dashboard": dashboard}
             if self.include_projects:
                 result["projects"] = collector.build_projects(refresh=False)
+                for project in result["projects"]:
+                    project["tokens_display"] = _format_integer(project.get("tokens", 0))
+                    project["tokensDisplay"] = project["tokens_display"]
             if self.include_quota_history:
                 result["quota_history"] = collector.build_quota_detail()
+                for cycle in result["quota_history"].get("cycles", []):
+                    cycle["tokens_display"] = _format_integer(cycle.get("tokens", 0))
             result["elapsed"] = round(time.monotonic() - started, 2)
             self.signals.completed.emit(self.request_id, result, "")
         except Exception as exc:
@@ -176,6 +235,8 @@ class Store(QObject):
     activePageChanged = Signal()
     periodChanged = Signal()
     settingsChanged = Signal()
+    floatingVisibleChanged = Signal()
+    exitRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -195,6 +256,11 @@ class Store(QObject):
             self._settings.setdefault(config_key, bool(config.get(config_key, False)))
         self._settings.setdefault("sub2api_base_url", config.get("sub2api_base_url", ""))
         self._settings.setdefault("keep_awake", False)
+        self._settings.setdefault("close_behavior", "tray")
+        self._settings.setdefault("show_floating_widget", True)
+        self._settings["refresh_seconds"] = _normalize_refresh_seconds(
+            self._settings.get("refresh_seconds", 60))
+        self._floating_visible = False
         self._request_id = ""
         self._pool = QThreadPool.globalInstance()
         self._pending_projects = False
@@ -209,27 +275,31 @@ class Store(QObject):
             logging.warning("Could not restore the keep-awake setting")
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.refresh)
-        self._timer.start(max(30, int(self._settings.get("refresh_seconds", 30))) * 1000)
+        self._timer.start(self._settings["refresh_seconds"] * 1000)
 
     @Property("QVariantMap", notify=snapshotChanged)
     def snapshot(self) -> dict[str, Any]:
-        return self._snapshot
+        return _qml_safe(self._snapshot)
 
     @Property("QVariantMap", notify=snapshotChanged)
     def dashboard(self) -> dict[str, Any]:
-        return self._dashboard
+        return _qml_safe(self._dashboard)
 
     @Property("QVariantList", notify=snapshotChanged)
     def cards(self) -> list[dict[str, Any]]:
-        return self._build_cards()
+        return _qml_safe(self._build_cards())
+
+    @Property("QVariantList", notify=snapshotChanged)
+    def floatingTools(self) -> list[dict[str, Any]]:
+        return _qml_safe(_top_tools(self._snapshot))
 
     @Property("QVariantList", notify=snapshotChanged)
     def projects(self) -> list[dict[str, Any]]:
-        return self._projects
+        return _qml_safe(self._projects)
 
     @Property("QVariantMap", notify=snapshotChanged)
     def quotaHistory(self) -> dict[str, Any]:
-        return self._quota_history
+        return _qml_safe(self._quota_history)
 
     @Property(bool, notify=busyChanged)
     def busy(self) -> bool:
@@ -258,6 +328,10 @@ class Store(QObject):
     @Property("QVariantMap", notify=settingsChanged)
     def settings(self) -> dict[str, Any]:
         return self._settings
+
+    @Property(bool, notify=floatingVisibleChanged)
+    def floatingVisible(self) -> bool:
+        return self._floating_visible
 
     @Property(str, notify=snapshotChanged)
     def traySummary(self) -> str:
@@ -363,9 +437,39 @@ class Store(QObject):
         _save_settings(self._settings)
         self.settingsChanged.emit()
 
+    @Slot(str)
+    def setCloseBehavior(self, behavior: str) -> None:
+        if behavior not in {"exit", "tray"}:
+            return
+        self._settings["close_behavior"] = behavior
+        _save_settings(self._settings)
+        self.settingsChanged.emit()
+
+    @Slot(bool)
+    def setFloatingWidgetEnabled(self, enabled: bool) -> None:
+        self._settings["show_floating_widget"] = enabled
+        _save_settings(self._settings)
+        self.settingsChanged.emit()
+        if not enabled:
+            self.setFloatingVisible(False)
+
+    @Slot(bool)
+    def setFloatingVisible(self, visible: bool) -> None:
+        if self._floating_visible == visible:
+            return
+        self._floating_visible = visible
+        self.floatingVisibleChanged.emit()
+
+    @Slot()
+    def handleWindowClose(self) -> None:
+        if self._settings.get("close_behavior", "tray") == "exit":
+            self.exitRequested.emit()
+            return
+        self.setFloatingVisible(bool(self._settings.get("show_floating_widget", True)))
+
     @Slot(int)
     def setRefreshSeconds(self, seconds: int) -> None:
-        seconds = min(300, max(30, seconds))
+        seconds = _normalize_refresh_seconds(seconds)
         self._settings["refresh_seconds"] = seconds
         self._timer.start(seconds * 1000)
         _save_settings(self._settings)
@@ -443,6 +547,7 @@ class Store(QObject):
                 continue
             selected_range = self._settings.get("card_period", "today")
             today = ((data.get("ranges") or {}).get(selected_range) or {})
+            total_tokens = sum(_integer(today.get(field)) for field in ("in", "out", "cached", "cr", "cw", "reason"))
             quota = data.get("quota") if isinstance(data.get("quota"), dict) else data
             metrics = []
             for name in ("in", "out", "cached", "cr", "cw", "reason", "sessions", "calls", "tasks", "cost", "cost_cny", "credits"):
@@ -478,7 +583,11 @@ class Store(QObject):
             status = "有数据" if metrics or quotas else "暂无本地数据"
             if isinstance(quota, dict) and quota.get("available") is False and ("windows" in quota or "details" in quota):
                 status = "额度不可用"
-            cards.append({"key": key, "title": title, "tint": color, "status": status, "metrics": metrics[:6], "quotas": quotas[:3]})
+            cards.append({"key": key, "title": title, "tint": color,
+                          "total_tokens": total_tokens,
+                          "total_tokens_display": _format_integer(total_tokens),
+                          "totalTokensDisplay": _format_integer(total_tokens),
+                          "status": status, "metrics": metrics[:6], "quotas": quotas[:3]})
         return cards
 
     def _make_summary(self) -> str:

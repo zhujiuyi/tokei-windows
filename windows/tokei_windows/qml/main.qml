@@ -196,7 +196,7 @@ ApplicationWindow {
                                     indicator: Text { x: cardPeriodCombo.width - width - 9; y: (cardPeriodCombo.height - height) / 2; text: "⌄"; color: "#a6a7b0"; font.pixelSize: 14 }
                                     background: Rectangle { radius: 8; color: "#2c2d34"; border.color: "#464750" }
                                 }
-                                Text { text: "每 " + (store.settings.refresh_seconds || 30) + " 秒更新"; color: soft; font.pixelSize: 10 }
+                                Text { text: "每 " + (store.settings.refresh_seconds || 60) + " 秒更新"; color: soft; font.pixelSize: 10 }
                             }
                             GridLayout {
                                 Layout.fillWidth: true
@@ -248,7 +248,7 @@ ApplicationWindow {
                                     anchors.fill: parent; anchors.margins: 18; spacing: 12
                                     Text { text: "模型用量排行"; color: ink; font.pixelSize: 14; font.weight: Font.DemiBold }
                                     Repeater {
-                                        model: (store.dashboard.models || []).slice(0, 12).map(function(item) { return { name: item.name || "未知模型", tokens: Number(item.in || 0) + Number(item.out || 0) + Number(item.cr || 0) + Number(item.cw || 0), cost: Number(item.cost || 0) } })
+                                        model: (store.dashboard.models || []).slice(0, 12).map(function(item) { return { name: item.name || "未知模型", tokensDisplay: item.tokens_display || "0", cost: Number(item.cost || 0) } })
                                         delegate: ModelRow { Layout.fillWidth: true }
                                     }
                                 }
@@ -275,7 +275,7 @@ ApplicationWindow {
                             Layout.fillWidth: true; spacing: 14
                             Text { text: "额度周期历史"; color: ink; font.pixelSize: 16; font.weight: Font.DemiBold }
                             Repeater {
-                                model: (store.quotaHistory.cycles || []).map(function(cycle) { return { cycle: cycle } })
+                                model: (store.quotaHistory.cycles || []).map(function(cycle) { return { cycle: cycle, tokensDisplay: cycle.tokens_display || "0" } })
                                 delegate: QuotaCycleCard { Layout.fillWidth: true }
                             }
                             Rectangle {
@@ -290,7 +290,7 @@ ApplicationWindow {
                             visible: store.activePage === "settings"
                             Layout.fillWidth: true; spacing: 16
                             Rectangle {
-                                Layout.fillWidth: true; implicitHeight: 280; radius: 16
+                                Layout.fillWidth: true; implicitHeight: 420; radius: 16
                                 color: "#222329"; border.color: "#393a42"
                                 ColumnLayout {
                                     anchors.fill: parent; anchors.margins: 18; spacing: 13
@@ -304,7 +304,7 @@ ApplicationWindow {
                                         }
                                         Switch { checked: store.settings.start_at_login === true; onToggled: store.setStartAtLogin(checked) }
                                     }
-                                    Rectangle { Layout.fillWidth: true; height: 1; color: "#383941" }
+                                    Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#383941" }
                                     RowLayout {
                                         Layout.fillWidth: true
                                         ColumnLayout {
@@ -314,7 +314,37 @@ ApplicationWindow {
                                         }
                                         Switch { checked: store.settings.keep_awake === true; onToggled: store.setKeepAwake(checked) }
                                     }
-                                    Rectangle { Layout.fillWidth: true; height: 1; color: "#383941" }
+                                    Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#383941" }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        ColumnLayout {
+                                            Layout.fillWidth: true; spacing: 3
+                                            Text { text: "点击关闭按钮时"; color: ink; font.pixelSize: 12 }
+                                            Text { text: "选择退出应用或隐藏到系统托盘"; color: soft; font.pixelSize: 10 }
+                                        }
+                                        ComboBox {
+                                            id: closeBehaviorCombo
+                                            Layout.preferredWidth: 126
+                                            model: ["隐藏到托盘", "退出应用"]
+                                            currentIndex: store.settings.close_behavior === "exit" ? 1 : 0
+                                            onActivated: store.setCloseBehavior(currentIndex === 1 ? "exit" : "tray")
+                                            palette.text: "#e6e6ea"
+                                            contentItem: Text { leftPadding: 10; rightPadding: 24; text: closeBehaviorCombo.displayText; color: "#e6e6ea"; font.pixelSize: 11; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
+                                            indicator: Text { x: closeBehaviorCombo.width - width - 9; y: (closeBehaviorCombo.height - height) / 2; text: "⌄"; color: "#a6a7b0"; font.pixelSize: 14 }
+                                            background: Rectangle { radius: 8; color: "#2c2d34"; border.color: "#464750" }
+                                        }
+                                    }
+                                    Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#383941" }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        ColumnLayout {
+                                            Layout.fillWidth: true; spacing: 3
+                                            Text { text: "隐藏到托盘时显示桌面浮窗"; color: ink; font.pixelSize: 12 }
+                                            Text { text: "展示今日用量排名前三的工具，可拖动和调整大小"; color: soft; font.pixelSize: 10; wrapMode: Text.WordWrap }
+                                        }
+                                        Switch { checked: store.settings.show_floating_widget !== false; onToggled: store.setFloatingWidgetEnabled(checked) }
+                                    }
+                                    Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#383941" }
                                     RowLayout {
                                         Layout.fillWidth: true
                                         ColumnLayout {
@@ -325,9 +355,9 @@ ApplicationWindow {
                                         ComboBox {
                                             id: refreshCombo
                                             Layout.preferredWidth: 126
-                                            model: ["30 秒", "60 秒", "120 秒", "300 秒"]
+                                            model: ["60 秒", "120 秒", "300 秒"]
                                             currentIndex: refreshIndex()
-                                            onActivated: store.setRefreshSeconds([30, 60, 120, 300][currentIndex])
+                                            onActivated: store.setRefreshSeconds([60, 120, 300][currentIndex])
                                             palette.text: "#e6e6ea"
                                             contentItem: Text { leftPadding: 10; rightPadding: 24; text: refreshCombo.displayText; color: "#e6e6ea"; font.pixelSize: 11; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
                                             indicator: Text { x: refreshCombo.width - width - 9; y: (refreshCombo.height - height) / 2; text: "⌄"; color: "#a6a7b0"; font.pixelSize: 14 }
@@ -420,6 +450,102 @@ ApplicationWindow {
     function activeTools() { var n = 0; var list = store.cards || []; for (var i = 0; i < list.length; i++) if (list[i].metrics.length || list[i].quotas.length) n++; return String(n) }
     function modelCount() { var list = (store.dashboard || {}).models || []; return String(list.length) }
     function pretty(n) { if (n >= 1000000) return (n / 1000000).toFixed(1) + "M"; if (n >= 10000) return (n / 1000).toFixed(1) + "K"; return Math.round(n).toLocaleString() }
-    function refreshIndex() { var s = store.settings.refresh_seconds || 30; return s >= 300 ? 3 : s >= 120 ? 2 : s >= 60 ? 1 : 0 }
-    onClosing: function(close) { close.accepted = false; win.hide() }
+    function refreshIndex() { var s = store.settings.refresh_seconds || 60; return s >= 300 ? 2 : s >= 120 ? 1 : 0 }
+    onClosing: function(close) { close.accepted = false; store.handleWindowClose(); win.hide() }
+
+    Window {
+        id: floatingWindow
+        objectName: "floatingWidget"
+        visible: store.floatingVisible
+        width: 360
+        height: 224
+        minimumWidth: 260
+        minimumHeight: 150
+        flags: Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+        color: "transparent"
+        opacity: 0.86
+        title: "Tokei 今日用量"
+
+        Rectangle {
+            id: floatingPanel
+            anchors.fill: parent
+            anchors.margins: 1
+            radius: 16
+            color: "#202126"
+            border.color: "#665458"
+            border.width: 1
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: Math.max(11, Math.min(18, floatingWindow.width / 22))
+                spacing: Math.max(6, Math.min(11, floatingWindow.height / 20))
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 30
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 1
+                        Text { text: "今日工具用量"; color: "#f8f8fa"; font.pixelSize: Math.max(12, Math.min(16, floatingWindow.width / 23)); font.weight: Font.DemiBold }
+                        Text { text: store.lastUpdated; color: "#9697a0"; font.pixelSize: Math.max(8, Math.min(10, floatingWindow.width / 36)) }
+                    }
+                    Rectangle {
+                        Layout.preferredWidth: 25; Layout.preferredHeight: 25; radius: 7
+                        color: floatingCloseMouse.containsMouse ? "#493435" : "transparent"
+                        Text { anchors.centerIn: parent; text: "×"; color: "#d1d1d6"; font.pixelSize: 18 }
+                        MouseArea { id: floatingCloseMouse; anchors.fill: parent; hoverEnabled: true; onClicked: store.setFloatingVisible(false) }
+                    }
+                }
+
+                Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#383941" }
+
+                Repeater {
+                    model: store.floatingTools.map(function(tool) {
+                        return { toolTitle: tool.title, toolTint: tool.tint, tokensDisplay: tool.tokens_display }
+                    })
+                    delegate: RowLayout {
+                        required property string toolTitle
+                        required property color toolTint
+                        required property string tokensDisplay
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        spacing: 8
+                        Rectangle { Layout.preferredWidth: 7; Layout.preferredHeight: 7; radius: 4; color: toolTint }
+                        Text { text: toolTitle; color: "#dcdce1"; font.pixelSize: Math.max(10, Math.min(13, floatingWindow.width / 28)); Layout.fillWidth: true; elide: Text.ElideRight }
+                        Text { text: tokensDisplay + " Token"; color: "#f2c1b4"; font.pixelSize: Math.max(8, Math.min(13, floatingWindow.width / 34)); font.weight: Font.Medium; horizontalAlignment: Text.AlignRight }
+                    }
+                }
+
+                Text {
+                    visible: store.floatingTools.length === 0
+                    text: "今天还没有可显示的 Token 用量"
+                    color: "#a6a7b0"
+                    font.pixelSize: Math.max(10, Math.min(12, floatingWindow.width / 30))
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    verticalAlignment: Text.AlignVCenter
+                    horizontalAlignment: Text.AlignHCenter
+                }
+            }
+
+            MouseArea {
+                width: parent.width - 42
+                height: 34
+                anchors.left: parent.left
+                anchors.top: parent.top
+                cursorShape: Qt.SizeAllCursor
+                onPressed: floatingWindow.startSystemMove()
+            }
+
+            MouseArea {
+                width: 22; height: 22
+                anchors.right: parent.right; anchors.bottom: parent.bottom
+                cursorShape: Qt.SizeFDiagCursor
+                onPressed: floatingWindow.startSystemResize(Qt.RightEdge | Qt.BottomEdge)
+                Rectangle { anchors.right: parent.right; anchors.bottom: parent.bottom; width: 9; height: 9; color: "transparent"; border.color: "#9b7f79"; rotation: 45 }
+            }
+        }
+
+        onClosing: function(close) { close.accepted = false; store.setFloatingVisible(false) }
+    }
 }

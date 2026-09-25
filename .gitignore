@@ -16,6 +16,7 @@ windows/build/
 windows/deployment/
 windows/dist/
 windows/.build-source/
+windows/.build-smoke/
 windows/*.egg-info/
 windows/*.build/
 windows/*.onefile-build/

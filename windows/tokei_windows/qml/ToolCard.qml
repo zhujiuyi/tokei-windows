@@ -4,6 +4,7 @@ import QtQuick.Layouts
 Rectangle {
     id: root
     required property string title
+    required property string totalTokensDisplay
     required property color tint
     required property string status
     required property var metrics
@@ -31,6 +32,7 @@ Rectangle {
                 Layout.fillWidth: true
                 elide: Text.ElideRight
             }
+            Text { text: root.totalTokensDisplay + " Token"; color: root.tint; font.pixelSize: 9; font.weight: Font.Medium }
             Text { text: root.status; color: "#9d9ea8"; font.pixelSize: 9 }
         }
 

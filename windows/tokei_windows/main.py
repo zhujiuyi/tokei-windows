@@ -8,7 +8,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
 
 from PySide6.QtCore import QLockFile, QSize, QStandardPaths, Qt, QUrl
-from PySide6.QtGui import QAction, QColor, QCursor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QCursor, QIcon, QPainter, QPen, QPixmap, QWindow
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
@@ -66,6 +66,32 @@ def _place_window_on_current_screen(window, app) -> None:
     window.setGeometry(x, y, width, height)
 
 
+def _floating_widget_geometry(
+    available: tuple[int, int, int, int],
+    requested_width: int = 360,
+    requested_height: int = 224,
+    margin: int = 24,
+) -> tuple[int, int, int, int]:
+    left, top, screen_width, screen_height = available
+    width = min(requested_width, max(1, screen_width - margin * 2))
+    height = min(requested_height, max(1, screen_height - margin * 2))
+    x = left + max(0, screen_width - width - margin)
+    y = top + margin
+    return x, y, width, height
+
+
+def _place_floating_widget_on_current_screen(window, app) -> None:
+    if window is None:
+        return
+    screen = app.screenAt(QCursor.pos()) or app.primaryScreen()
+    if screen is None:
+        return
+    available = screen.availableGeometry()
+    x, y, width, height = _floating_widget_geometry(available.getRect())
+    window.setMinimumSize(QSize(min(260, width), min(150, height)))
+    window.setGeometry(x, y, width, height)
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Tokei-Windows")
@@ -87,6 +113,7 @@ def main() -> int:
         logging.error("Could not load QML UI from %s", _qml_url().toLocalFile())
         return 2
     window = engine.rootObjects()[0]
+    floating_window = window.findChild(QWindow, "floatingWidget")
 
     tray = QSystemTrayIcon(_app_icon(), app)
     tray.setToolTip(store.traySummary)
@@ -101,6 +128,7 @@ def main() -> int:
     tray.setContextMenu(tray_menu)
 
     def show_window() -> None:
+        store.setFloatingVisible(False)
         if not any(screen.availableGeometry().contains(window.geometry()) for screen in app.screens()):
             _place_window_on_current_screen(window, app)
         window.show()
@@ -111,6 +139,7 @@ def main() -> int:
         tray.setToolTip(store.traySummary[:127])
 
     def exit_app() -> None:
+        store.setFloatingVisible(False)
         tray.hide()
         app.quit()
 
@@ -121,9 +150,11 @@ def main() -> int:
     open_action.triggered.connect(show_window)
     refresh_action.triggered.connect(store.refresh)
     exit_action.triggered.connect(exit_app)
+    store.exitRequested.connect(exit_app)
     store.snapshotChanged.connect(update_tooltip)
     store.lastUpdatedChanged.connect(update_tooltip)
     _place_window_on_current_screen(window, app)
+    _place_floating_widget_on_current_screen(floating_window, app)
     window.show()
     tray.show()
     store.refresh()

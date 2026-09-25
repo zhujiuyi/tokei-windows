@@ -6,10 +6,11 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
 
-from PySide6.QtCore import QCoreApplication, QEvent, QUrl
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QUrl
 from PySide6.QtGui import QFont, QFontDatabase
-from PySide6.QtQuick import QQuickWindow
+from PySide6.QtQuick import QQuickItem, QQuickWindow
 from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from shiboken6 import getCppPointer, wrapInstance
 
@@ -33,6 +34,8 @@ def main() -> int:
         "sub2api_quota_enabled": False,
         "zai_quota_enabled": False,
         "zai_region": "global",
+        "close_behavior": "tray",
+        "show_floating_widget": True,
     }
     store._snapshot = {
         "claude": {
@@ -49,22 +52,22 @@ def main() -> int:
     }
     store._dashboard = {
         "daily": [
-            {"d": "2026-09-23", "total_cost": 0.31},
-            {"d": "2026-09-24", "total_cost": 0.45},
-            {"d": "2026-09-25", "total_cost": 0.58},
+            {"date": "2026-09-23", "total_cost": 0.31, "tokens": 18000, "tokens_display": "18,000", "date_label": "09-23"},
+            {"date": "2026-09-24", "total_cost": 0.45, "tokens": 24500, "tokens_display": "24,500", "date_label": "09-24"},
+            {"date": "2026-09-25", "total_cost": 0.58, "tokens": 32600, "tokens_display": "32,600", "date_label": "09-25"},
         ],
         "models": [
-            {"name": "claude-sonnet-4-6", "in": 42000, "out": 8500, "cr": 21000, "cw": 1000, "cost": 0.82},
-            {"name": "gpt-5-codex", "in": 18000, "out": 2900, "cr": 3500, "cw": 0, "cost": 0.38},
+            {"name": "claude-sonnet-4-6", "tokens": 72500, "tokens_display": "72,500", "cost": 0.82},
+            {"name": "gpt-5-codex", "tokens": 24400, "tokens_display": "24,400", "cost": 0.38},
         ],
     }
     store._projects = [
-        {"name": "tokei-windows", "path": "E:/work/tokei-windows", "tokens": 58200, "cost": 1.2, "sessions": 8, "tools": ["Claude", "Codex"]}
+        {"name": "tokei-windows", "path": "E:/work/tokei-windows", "tokens": 58200, "tokens_display": "58,200", "tokensDisplay": "58,200", "cost": 1.2, "sessions": 8, "tools": ["Claude", "Codex"]}
     ]
     store._quota_history = {
         "cycles": [
-            {"tool": "claude", "current": True, "used_pct": 62.0, "tokens": 75200},
-            {"tool": "codex", "current": False, "used_pct": 41.5, "tokens": 39400},
+            {"tool": "claude", "current": True, "used_pct": 62.0, "tokens": 75200, "tokens_display": "75,200"},
+            {"tool": "codex", "current": False, "used_pct": 41.5, "tokens": 39400, "tokens_display": "39,400"},
         ]
     }
     store._last_updated = "2026-09-25 20:00:00"
@@ -92,6 +95,40 @@ def main() -> int:
             print(f"No frame for page: {page}")
             return 3
         image.save(str(output / f"preview-{page}.png"))
+    store.setPage("dashboard")
+    app.processEvents()
+    trend = window.findChild(QQuickItem, "trendCard")
+    chart_mouse = window.findChild(QQuickItem, "trendChartMouse")
+    if trend is None or chart_mouse is None:
+        print("Trend chart hover target was not created")
+        return 5
+    hover_point = chart_mouse.mapToScene(QPointF(chart_mouse.width() / 2, chart_mouse.height() / 2))
+    QTest.mouseMove(quick_window, QPoint(round(hover_point.x()), round(hover_point.y())))
+    app.processEvents()
+    if trend.property("selectedIndex") < 0:
+        print("Trend chart did not select a point on hover")
+        return 6
+    quick_window.grabWindow().save(str(output / "preview-dashboard-hover.png"))
+    floating = window.findChild(QQuickWindow, "floatingWidget")
+    window.close()
+    app.processEvents()
+    if floating is None or window.isVisible() or not floating.isVisible() or floating.grabWindow().isNull():
+        print("Closing to the tray did not show the floating widget")
+        return 4
+    floating.grabWindow().save(str(output / "preview-floating.png"))
+    store.setFloatingVisible(False)
+    window.show()
+    app.processEvents()
+    if not window.isVisible() or floating.isVisible():
+        print("Restoring the main window did not hide the floating widget")
+        return 7
+    exit_requested = []
+    store.exitRequested.connect(lambda: exit_requested.append(True))
+    store._settings["close_behavior"] = "exit"
+    store.handleWindowClose()
+    if not exit_requested:
+        print("The exit close behavior was not emitted")
+        return 8
     store._timer.stop()
     window.close()
     engine.deleteLater()
@@ -99,7 +136,7 @@ def main() -> int:
     store.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     app.processEvents()
-    print(f"Rendered 5 pages to {output}")
+    print(f"Rendered 5 pages and the floating widget to {output}")
     return 0
 
 

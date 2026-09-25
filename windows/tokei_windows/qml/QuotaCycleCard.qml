@@ -4,6 +4,7 @@ import QtQuick.Layouts
 Rectangle {
     id: root
     required property var cycle
+    required property string tokensDisplay
     implicitHeight: 94
     radius: 15
     color: "#25262d"
@@ -28,7 +29,7 @@ Rectangle {
         RowLayout {
             Layout.fillWidth: true
             Text { text: "消耗 " + Number(root.cycle.used_pct || 0).toFixed(1) + "%"; color: "#d9b0a7"; font.pixelSize: 10; Layout.fillWidth: true }
-            Text { text: Number(root.cycle.tokens || 0).toLocaleString() + " Token"; color: "#c6c6cc"; font.pixelSize: 10 }
+            Text { text: root.tokensDisplay + " Token"; color: "#c6c6cc"; font.pixelSize: 10 }
         }
         Rectangle {
             Layout.fillWidth: true

@@ -9,8 +9,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tokei_windows import collector
-from tokei_windows.bridge import Store, _RefreshJob, _format_number
-from tokei_windows.main import _centered_window_geometry
+from tokei_windows.bridge import (
+    Store,
+    _RefreshJob,
+    _format_integer,
+    _format_number,
+    _normalize_refresh_seconds,
+    _qml_safe,
+    _top_tools,
+)
+from tokei_windows.main import _centered_window_geometry, _floating_widget_geometry
 
 
 class WindowsCollectorTests(unittest.TestCase):
@@ -63,7 +71,11 @@ class WindowsCollectorTests(unittest.TestCase):
         events = []
         job.signals.completed.connect(lambda *args: events.append(args))
         usage = {"claude": {"ranges": {"today": {"in": 100}}}}
-        daily = {"daily": [{"claude": 1.25, "codex": 0.75}]}
+        large_total = 12345678901234567890
+        daily = {
+            "daily": [{"date": "2026-09-24", "tokens": large_total, "claude": 1.25, "codex": 0.75}],
+            "models": [{"name": "large-model", "tokens": large_total}],
+        }
         cache = {"cached": True}
 
         with patch.object(collector, "compute", return_value=usage) as compute, \
@@ -82,6 +94,9 @@ class WindowsCollectorTests(unittest.TestCase):
         self.assertEqual(result["usage"], usage)
         self.assertEqual(result["dashboard"]["wrapped"], {"ready": True})
         self.assertEqual(result["dashboard"]["daily"][0]["total_cost"], 2.0)
+        self.assertEqual(result["dashboard"]["daily"][0]["date_label"], "09-24")
+        self.assertEqual(result["dashboard"]["daily"][0]["tokens_display"], "12,345,678,901,234,567,890")
+        self.assertEqual(result["dashboard"]["models"][0]["tokens_display"], "12,345,678,901,234,567,890")
 
     def test_windows_project_process_discovery_has_a_safe_empty_result(self) -> None:
         # The helper should return a list even when no supported CLI server is running.
@@ -107,6 +122,23 @@ class DashboardPresentationTests(unittest.TestCase):
         self.assertTrue(claude["quotas"][0]["stale"])
         self.assertEqual(claude["metrics"][0]["value"], "1,200")
 
+    def test_cards_sum_token_fields_for_selected_period(self) -> None:
+        state = SimpleNamespace(
+            _snapshot={
+                "claude": {
+                    "ranges": {
+                        "today": {"in": 3, "out": 5},
+                        "week": {"in": 12345678901234567890, "out": 10, "cached": 20, "reason": 30},
+                    },
+                },
+            },
+            _settings={"card_period": "week"},
+        )
+        cards = Store._build_cards(state)
+        claude = next(card for card in cards if card["key"] == "claude")
+        self.assertEqual(claude["total_tokens"], 12345678901234567950)
+        self.assertEqual(claude["total_tokens_display"], "12,345,678,901,234,567,950")
+
     def test_tray_summary_is_short_and_includes_today_usage(self) -> None:
         state = SimpleNamespace(
             _snapshot={
@@ -126,6 +158,27 @@ class DashboardPresentationTests(unittest.TestCase):
         self.assertEqual(_format_number(24_500), "24.5K")
         self.assertEqual(_format_number(1234), "1,234")
 
+    def test_large_integer_format_does_not_use_scientific_notation(self) -> None:
+        self.assertEqual(_format_integer("1.234567890123456789e19"), "12,345,678,901,234,567,890")
+        self.assertEqual(_qml_safe({"tokens": 12345678901234567890}), {"tokens": "12345678901234567890"})
+
+    def test_floating_widget_ranks_only_tools_with_token_data(self) -> None:
+        snapshot = {
+            "claude": {"ranges": {"today": {"in": 100, "out": 50}}},
+            "codex": {"ranges": {"today": {"in": 900}}},
+            "gemini": {"ranges": {"today": {"in": 300}}},
+            "cursor": {"ranges": {"today": {"in": 0}}},
+        }
+        tools = _top_tools(snapshot)
+        self.assertEqual([tool["key"] for tool in tools], ["codex", "gemini", "claude"])
+        self.assertEqual(tools[0]["tokens_display"], "900")
+
+    def test_refresh_interval_defaults_to_one_minute_and_is_bounded(self) -> None:
+        self.assertEqual(_normalize_refresh_seconds(None), 60)
+        self.assertEqual(_normalize_refresh_seconds(30), 60)
+        self.assertEqual(_normalize_refresh_seconds(120), 120)
+        self.assertEqual(_normalize_refresh_seconds(900), 300)
+
 
 class WindowGeometryTests(unittest.TestCase):
     def test_window_is_centered_on_monitor_with_negative_origin(self) -> None:
@@ -138,6 +191,16 @@ class WindowGeometryTests(unittest.TestCase):
         self.assertEqual(
             _centered_window_geometry((-800, 20, 800, 600)),
             (-800, 20, 800, 600),
+        )
+
+    def test_floating_widget_starts_inside_the_available_screen_area(self) -> None:
+        self.assertEqual(
+            _floating_widget_geometry((-1920, 0, 1920, 1080)),
+            (-384, 24, 360, 224),
+        )
+        self.assertEqual(
+            _floating_widget_geometry((0, 0, 280, 160)),
+            (24, 24, 232, 112),
         )
 
 
