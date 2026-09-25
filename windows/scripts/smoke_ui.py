@@ -6,7 +6,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
 
-from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QUrl
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, Qt, QUrl
 from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtQuick import QQuickItem, QQuickWindow
 from PySide6.QtQml import QQmlApplicationEngine
@@ -95,6 +95,40 @@ def main() -> int:
             print(f"No frame for page: {page}")
             return 3
         image.save(str(output / f"preview-{page}.png"))
+
+    combo_cases = (
+        ("overview", "cardPeriodCombo"),
+        ("dashboard", "dashboardPeriodCombo"),
+        ("settings", "closeBehaviorCombo"),
+        ("settings", "refreshCombo"),
+        ("settings", "zaiRegionCombo"),
+    )
+    original_size = quick_window.size()
+    quick_window.resize(1220, 1400)
+    app.processEvents()
+    for page, object_name in combo_cases:
+        store.setPage(page)
+        app.processEvents()
+        combo = window.findChild(QQuickItem, object_name)
+        if combo is None:
+            print(f"Dropdown was not created: {object_name}")
+            return 9
+        click_point = combo.mapToScene(QPointF(combo.width() / 2, combo.height() / 2))
+        QTest.mouseClick(quick_window, Qt.MouseButton.LeftButton, pos=QPoint(round(click_point.x()), round(click_point.y())))
+        app.processEvents()
+        if not combo.property("down"):
+            print(f"Dropdown did not open: {object_name}")
+            return 10
+        image = quick_window.grabWindow()
+        if image.isNull():
+            print(f"Dropdown frame was not rendered: {object_name}")
+            return 11
+        image.save(str(output / f"preview-{object_name}.png"))
+        QTest.keyClick(quick_window, Qt.Key.Key_Escape)
+        app.processEvents()
+    quick_window.resize(original_size)
+    app.processEvents()
+
     store.setPage("dashboard")
     app.processEvents()
     trend = window.findChild(QQuickItem, "trendCard")
@@ -136,7 +170,7 @@ def main() -> int:
     store.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     app.processEvents()
-    print(f"Rendered 5 pages and the floating widget to {output}")
+    print(f"Rendered 5 pages, 5 dropdowns, and the floating widget to {output}")
     return 0
 
 

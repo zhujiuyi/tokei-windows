@@ -185,16 +185,13 @@ ApplicationWindow {
                             RowLayout {
                                 Layout.fillWidth: true
                                 Text { text: "工具用量"; color: ink; font.pixelSize: 16; font.weight: Font.DemiBold; Layout.fillWidth: true }
-                                ComboBox {
+                                DarkComboBox {
                                     id: cardPeriodCombo
+                                    objectName: "cardPeriodCombo"
                                     Layout.preferredWidth: 130
                                     model: ["今天", "昨天", "本周", "上周", "本月", "今年"]
                                     currentIndex: store.cardPeriod === "today" ? 0 : store.cardPeriod === "yesterday" ? 1 : store.cardPeriod === "week" ? 2 : store.cardPeriod === "lastweek" ? 3 : store.cardPeriod === "month" ? 4 : 5
                                     onActivated: store.setCardPeriod(["today", "yesterday", "week", "lastweek", "month", "year"][currentIndex])
-                                    palette.text: "#e6e6ea"
-                                    contentItem: Text { leftPadding: 10; rightPadding: 24; text: cardPeriodCombo.displayText; color: "#e6e6ea"; font.pixelSize: 11; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
-                                    indicator: Text { x: cardPeriodCombo.width - width - 9; y: (cardPeriodCombo.height - height) / 2; text: "⌄"; color: "#a6a7b0"; font.pixelSize: 14 }
-                                    background: Rectangle { radius: 8; color: "#2c2d34"; border.color: "#464750" }
                                 }
                                 Text { text: "每 " + (store.settings.refresh_seconds || 60) + " 秒更新"; color: soft; font.pixelSize: 10 }
                             }
@@ -228,16 +225,13 @@ ApplicationWindow {
                             RowLayout {
                                 Layout.fillWidth: true
                                 Text { text: "成本与 Token 趋势"; color: ink; font.pixelSize: 16; font.weight: Font.DemiBold; Layout.fillWidth: true }
-                                ComboBox {
+                                DarkComboBox {
                                     id: dashboardPeriodCombo
+                                    objectName: "dashboardPeriodCombo"
                                     Layout.preferredWidth: 122
                                     model: ["7 天", "30 天", "90 天", "365 天", "全部"]
                                     currentIndex: store.period === "7d" ? 0 : store.period === "30d" ? 1 : store.period === "90d" ? 2 : store.period === "365d" ? 3 : 4
                                     onActivated: store.setPeriod(["7d", "30d", "90d", "365d", "all"][currentIndex])
-                                    palette.text: "#e6e6ea"
-                                    contentItem: Text { leftPadding: 10; rightPadding: 24; text: dashboardPeriodCombo.displayText; color: "#e6e6ea"; font.pixelSize: 11; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
-                                    indicator: Text { x: dashboardPeriodCombo.width - width - 9; y: (dashboardPeriodCombo.height - height) / 2; text: "⌄"; color: "#a6a7b0"; font.pixelSize: 14 }
-                                    background: Rectangle { radius: 8; color: "#2c2d34"; border.color: "#464750" }
                                 }
                             }
                             TrendCard { Layout.fillWidth: true; Layout.preferredHeight: 310; points: store.dashboard.daily || [] }
@@ -322,16 +316,13 @@ ApplicationWindow {
                                             Text { text: "点击关闭按钮时"; color: ink; font.pixelSize: 12 }
                                             Text { text: "选择退出应用或隐藏到系统托盘"; color: soft; font.pixelSize: 10 }
                                         }
-                                        ComboBox {
+                                        DarkComboBox {
                                             id: closeBehaviorCombo
+                                            objectName: "closeBehaviorCombo"
                                             Layout.preferredWidth: 126
                                             model: ["隐藏到托盘", "退出应用"]
                                             currentIndex: store.settings.close_behavior === "exit" ? 1 : 0
                                             onActivated: store.setCloseBehavior(currentIndex === 1 ? "exit" : "tray")
-                                            palette.text: "#e6e6ea"
-                                            contentItem: Text { leftPadding: 10; rightPadding: 24; text: closeBehaviorCombo.displayText; color: "#e6e6ea"; font.pixelSize: 11; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
-                                            indicator: Text { x: closeBehaviorCombo.width - width - 9; y: (closeBehaviorCombo.height - height) / 2; text: "⌄"; color: "#a6a7b0"; font.pixelSize: 14 }
-                                            background: Rectangle { radius: 8; color: "#2c2d34"; border.color: "#464750" }
                                         }
                                     }
                                     Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#383941" }
@@ -352,16 +343,13 @@ ApplicationWindow {
                                             Text { text: "自动刷新间隔"; color: ink; font.pixelSize: 12 }
                                             Text { text: "本地日志扫描和已开启的额度查询"; color: soft; font.pixelSize: 10 }
                                         }
-                                        ComboBox {
+                                        DarkComboBox {
                                             id: refreshCombo
+                                            objectName: "refreshCombo"
                                             Layout.preferredWidth: 126
                                             model: ["60 秒", "120 秒", "300 秒"]
                                             currentIndex: refreshIndex()
                                             onActivated: store.setRefreshSeconds([60, 120, 300][currentIndex])
-                                            palette.text: "#e6e6ea"
-                                            contentItem: Text { leftPadding: 10; rightPadding: 24; text: refreshCombo.displayText; color: "#e6e6ea"; font.pixelSize: 11; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
-                                            indicator: Text { x: refreshCombo.width - width - 9; y: (refreshCombo.height - height) / 2; text: "⌄"; color: "#a6a7b0"; font.pixelSize: 14 }
-                                            background: Rectangle { radius: 8; color: "#2c2d34"; border.color: "#464750" }
                                         }
                                     }
                                 }
@@ -407,16 +395,13 @@ ApplicationWindow {
                                     }
                                     RowLayout {
                                         Layout.fillWidth: true
-                                        ComboBox {
+                                        DarkComboBox {
                                             id: zaiRegionCombo
+                                            objectName: "zaiRegionCombo"
                                             Layout.preferredWidth: 150
                                             model: ["Global", "BigModel CN"]
                                             currentIndex: store.settings.zai_region === "bigmodel-cn" ? 1 : 0
                                             onActivated: store.setProviderSetting("zai", "zai_region", currentIndex === 1 ? "bigmodel-cn" : "global")
-                                            palette.text: "#e6e6ea"
-                                            contentItem: Text { leftPadding: 10; rightPadding: 24; text: zaiRegionCombo.displayText; color: "#e6e6ea"; font.pixelSize: 11; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
-                                            indicator: Text { x: zaiRegionCombo.width - width - 9; y: (zaiRegionCombo.height - height) / 2; text: "⌄"; color: "#a6a7b0"; font.pixelSize: 14 }
-                                            background: Rectangle { radius: 8; color: "#2c2d34"; border.color: "#464750" }
                                         }
                                         TextField { id: zaiKey; placeholderText: "z.ai API Key（留空删除）"; placeholderTextColor: "#747580"; echoMode: TextInput.Password; Layout.fillWidth: true; color: ink; background: Rectangle { radius: 8; color: "#191a1f"; border.color: "#44454d" } }
                                         Button {

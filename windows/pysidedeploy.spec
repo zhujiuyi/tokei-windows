@@ -34,7 +34,7 @@ android_packages = buildozer==1.5.0,cython==0.29.33
 # paths to required qml files. comma separated
 # normally all the qml files required by the project are added automatically
 # design studio projects include the qml files using qt resources
-qml_files = tokei_windows\qml\main.qml,tokei_windows\qml\SummaryCard.qml,tokei_windows\qml\ToolCard.qml,tokei_windows\qml\TrendCard.qml,tokei_windows\qml\ModelRow.qml,tokei_windows\qml\ProjectCard.qml,tokei_windows\qml\QuotaCycleCard.qml
+qml_files = tokei_windows\qml\main.qml,tokei_windows\qml\DarkComboBox.qml,tokei_windows\qml\SummaryCard.qml,tokei_windows\qml\ToolCard.qml,tokei_windows\qml\TrendCard.qml,tokei_windows\qml\ModelRow.qml,tokei_windows\qml\ProjectCard.qml,tokei_windows\qml\QuotaCycleCard.qml
 
 # excluded qml plugin binaries
 excluded_qml_plugins = QtCharts,QtSensors,QtWebEngine
