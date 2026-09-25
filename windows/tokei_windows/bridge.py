@@ -147,7 +147,7 @@ class _RefreshJob(QRunnable):
         started = time.monotonic()
         try:
             usage = collector.compute()
-            dashboard = collector.build_dashboard(self.period, refresh=False)
+            dashboard = collector.build_dashboard(self.period)
             cost_fields = (
                 "claude", "codex", "codex_reserve", "gemini", "grok", "zcode",
                 "mimocode", "devin", "pi", "workbuddy", "workbuddy_ai",

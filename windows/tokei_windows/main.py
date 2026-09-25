@@ -7,8 +7,8 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
 
-from PySide6.QtCore import QLockFile, QStandardPaths, Qt, QUrl
-from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QLockFile, QSize, QStandardPaths, Qt, QUrl
+from PySide6.QtGui import QAction, QColor, QCursor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
@@ -40,6 +40,30 @@ def _qml_url() -> QUrl:
         if containing_dir:
             path = Path(containing_dir) / "tokei_windows" / "qml" / "main.qml"
     return QUrl.fromLocalFile(str(path))
+
+
+def _centered_window_geometry(
+    available: tuple[int, int, int, int],
+    requested_width: int = 1220,
+    requested_height: int = 820,
+) -> tuple[int, int, int, int]:
+    left, top, screen_width, screen_height = available
+    width = max(1, min(requested_width, screen_width))
+    height = max(1, min(requested_height, screen_height))
+    x = left + (screen_width - width) // 2
+    y = top + (screen_height - height) // 2
+    return x, y, width, height
+
+
+def _place_window_on_current_screen(window, app) -> None:
+    screen = app.screenAt(QCursor.pos()) or app.primaryScreen()
+    if screen is None:
+        return
+
+    available = screen.availableGeometry()
+    x, y, width, height = _centered_window_geometry(available.getRect())
+    window.setMinimumSize(QSize(min(980, width), min(680, height)))
+    window.setGeometry(x, y, width, height)
 
 
 def main() -> int:
@@ -77,6 +101,8 @@ def main() -> int:
     tray.setContextMenu(tray_menu)
 
     def show_window() -> None:
+        if not any(screen.availableGeometry().contains(window.geometry()) for screen in app.screens()):
+            _place_window_on_current_screen(window, app)
         window.show()
         window.raise_()
         window.requestActivate()
@@ -97,6 +123,8 @@ def main() -> int:
     exit_action.triggered.connect(exit_app)
     store.snapshotChanged.connect(update_tooltip)
     store.lastUpdatedChanged.connect(update_tooltip)
+    _place_window_on_current_screen(window, app)
+    window.show()
     tray.show()
     store.refresh()
 

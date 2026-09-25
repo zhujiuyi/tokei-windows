@@ -5,7 +5,7 @@ import QtQuick.Window
 
 ApplicationWindow {
     id: win
-    visible: true
+    visible: false
     width: 1220
     height: 820
     minimumWidth: 980

@@ -36,6 +36,7 @@
 import os
 import sys
 import glob
+import errno
 import hashlib
 import json
 import math
@@ -43,6 +44,7 @@ import re
 import sqlite3
 import subprocess
 import threading
+import time
 from datetime import datetime, timedelta, date, timezone
 from pathlib import Path
 
@@ -991,18 +993,56 @@ def _load_ledger_from_disk():
     return {"v": _LEDGER_VERSION, "tools": {}}
 
 
+def _acquire_file_lock(lock_fd):
+    """Lock byte zero using the platform's standard-library file-lock API."""
+    if os.name == "nt":
+        import msvcrt
+
+        if os.fstat(lock_fd).st_size == 0:
+            os.write(lock_fd, b"\0")
+        busy_errors = {errno.EACCES, errno.EAGAIN, getattr(errno, "EDEADLK", 36)}
+        while True:
+            os.lseek(lock_fd, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
+                return "msvcrt"
+            except OSError as exc:
+                if exc.errno not in busy_errors:
+                    raise
+                time.sleep(0.05)
+
+    import fcntl
+
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    return "fcntl"
+
+
+def _release_file_lock(lock_fd, lock_kind):
+    if lock_kind == "msvcrt":
+        import msvcrt
+
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
+    elif lock_kind == "fcntl":
+        import fcntl
+
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+
 def ledger_flush():
     """把内存账本变更落盘:短锁内与磁盘最新状态做天级高水位合并后原子写。
     每轮扫描只调一次,替代此前每工具一次的 15 轮锁+读+写(性能回归根因)。"""
     if not _LEDGER_CACHE["dirty"] or _LEDGER_CACHE["data"] is None:
         return
     lock_fd = None
+    lock_kind = None
     try:
-        import fcntl
         os.makedirs(os.path.dirname(_LEDGER_FILE), mode=0o700, exist_ok=True)
         lock_fd = os.open(f"{_LEDGER_FILE}.lock", os.O_CREAT | os.O_RDWR, 0o600)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        lock_kind = _acquire_file_lock(lock_fd)
     except OSError:
+        if lock_fd is not None:
+            os.close(lock_fd)
         lock_fd = None
     try:
         fresh = _load_ledger_from_disk()
@@ -1043,11 +1083,9 @@ def ledger_flush():
     finally:
         if lock_fd is not None:
             try:
-                import fcntl
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(lock_fd)
+                _release_file_lock(lock_fd, lock_kind)
+            finally:
+                os.close(lock_fd)
 
 
 def _save_ledger(ledger):
@@ -1318,22 +1356,18 @@ def ledger_touch(tool):
 
 def _with_scan_cache_lock(fn):
     def locked(*args, **kwargs):
-        try:
-            import fcntl
-        except ImportError:
-            return fn(*args, **kwargs)
-
         lock_path = f"{_SCAN_CACHE_FILE}.lock"
         lock_dir = os.path.dirname(lock_path)
         if lock_dir:
             os.makedirs(lock_dir, exist_ok=True)
-        lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        lock_kind = None
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            lock_kind = _acquire_file_lock(lock_fd)
             return fn(*args, **kwargs)
         finally:
             try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                _release_file_lock(lock_fd, lock_kind)
             finally:
                 os.close(lock_fd)
     return locked
