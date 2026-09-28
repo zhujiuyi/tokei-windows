@@ -6,6 +6,10 @@ import QtQuick.Controls
 ComboBox {
     id: control
 
+    // 与相邻控件对齐:右上角按钮与设置页输入框 40、窗口图标按钮 34,取 36 兼顾两种行高。
+    // 不设高度时控件由 11px 文本撑出(约 22–26px),在按钮/开关旁边显得"扁"。
+    implicitHeight: 36
+
     palette.text: "#e6ebf3"
 
     contentItem: Text {
@@ -13,7 +17,7 @@ ComboBox {
         rightPadding: 34
         text: control.displayText
         color: "#e6ebf3"
-        font.pixelSize: 11
+        font.pixelSize: 12
         verticalAlignment: Text.AlignVCenter
         elide: Text.ElideRight
     }
@@ -59,7 +63,7 @@ ComboBox {
             text: optionDelegate.text
             leftPadding: 10
             color: "#e6ebf3"
-            font.pixelSize: 11
+            font.pixelSize: 12
             verticalAlignment: Text.AlignVCenter
             elide: Text.ElideRight
         }

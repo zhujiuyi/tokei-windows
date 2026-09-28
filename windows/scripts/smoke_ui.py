@@ -38,17 +38,27 @@ def main() -> int:
         "show_floating_widget": True,
     }
     store._snapshot = {
+        # models 不是可选装饰:总览的「模型数量」按所选周期的 ranges[*].models 去重统计。
         "claude": {
-            "ranges": {"today": {"in": 32500, "out": 5700, "cached": 21800, "cost": 0.41}},
+            "ranges": {"today": {
+                "in": 32500, "out": 5700, "cached": 21800, "cost": 0.41,
+                "models": [
+                    {"name": "Opus 5.5", "in": 24000, "out": 5000, "cost": 0.32},
+                    {"name": "Deepseek V4.1 Flash", "in": 8500, "out": 700, "cost": 0.09},
+                ]}},
         },
         "claude_desktop": {
-            "ranges": {"today": {"in": 4200, "out": 900, "cost": 0.13}},
+            "ranges": {"today": {
+                "in": 4200, "out": 900, "cost": 0.13,
+                "models": [{"name": "Opus 5.5 (Claude Desktop)", "in": 4200, "out": 900, "cost": 0.13}]}},
             "q5": 38,
             "q7": 64,
             "qf": 12,
         },
         "codex": {
-            "ranges": {"today": {"in": 12400, "out": 3100, "cost": 0.17}},
+            "ranges": {"today": {
+                "in": 12400, "out": 3100, "cost": 0.17,
+                "models": [{"name": "GPT-5.5 (Codex)", "in": 12400, "out": 3100, "cost": 0.17}]}},
             "p5": 31,
             "pw": 58,
         },

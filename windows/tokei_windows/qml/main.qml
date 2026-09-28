@@ -357,8 +357,8 @@ ApplicationWindow {
                                 spacing: 16
                                 Repeater {
                                     model: [
-                                        { label: "今日估算成本", value: rootCost(), tint: "#f09578" },
-                                        { label: "今日 Token", value: rootTokens(), tint: "#79aef7" },
+                                        { label: "估算成本", value: rootCost(), tint: "#f09578" },
+                                        { label: "Token", value: rootTokens(), tint: "#79aef7" },
                                         { label: "活跃工具", value: activeTools(), tint: "#af9af4" },
                                         { label: "模型数量", value: modelCount(), tint: "#75d6ae" }
                                     ]
@@ -628,18 +628,32 @@ ApplicationWindow {
         }
     }
 
+    // 总览顶部四项与「工具用量」下拉同口径:都按 store.cardPeriod 取 ranges 里对应的周期桶。
+    function periodKey() { return store.cardPeriod || "today" }
+    function periodRange(key) { return (((store.snapshot || {})[key] || {}).ranges || {})[periodKey()] || {} }
     function rootCost() {
         var total = 0; var keys = Object.keys(store.snapshot || {})
-        for (var i = 0; i < keys.length; i++) { var r = (((store.snapshot[keys[i]] || {}).ranges || {}).today || {}); total += Number(r.cost || 0) }
+        for (var i = 0; i < keys.length; i++) total += Number(periodRange(keys[i]).cost || 0)
         return "$" + Number(total).toFixed(2)
     }
     function rootTokens() {
         var total = 0; var keys = Object.keys(store.snapshot || {})
-        for (var i = 0; i < keys.length; i++) { var r = (((store.snapshot[keys[i]] || {}).ranges || {}).today || {}); total += Number(r.in || 0) + Number(r.out || 0) + Number(r.cached || 0) + Number(r.cr || 0) + Number(r.cw || 0) + Number(r.reason || 0) }
+        for (var i = 0; i < keys.length; i++) { var r = periodRange(keys[i]); total += Number(r.in || 0) + Number(r.out || 0) + Number(r.cached || 0) + Number(r.cr || 0) + Number(r.cw || 0) + Number(r.reason || 0) }
         return pretty(total)
     }
     function activeTools() { var n = 0; var list = store.cards || []; for (var i = 0; i < list.length; i++) if (list[i].metrics.length || list[i].quotas.length) n++; return String(n) }
-    function modelCount() { var list = (store.dashboard || {}).models || []; return String(list.length) }
+    // 模型数量同样按该周期统计:跨工具按模型名去重(与卡片弹窗的模型行同源)。
+    function modelCount() {
+        var seen = {}; var n = 0; var keys = Object.keys(store.snapshot || {})
+        for (var i = 0; i < keys.length; i++) {
+            var list = periodRange(keys[i]).models || []
+            for (var j = 0; j < list.length; j++) {
+                var name = String(list[j].name || "").toLowerCase()
+                if (name && !seen[name]) { seen[name] = true; n++ }
+            }
+        }
+        return String(n)
+    }
     function pretty(n) { if (n >= 1000000) return (n / 1000000).toFixed(1) + "M"; if (n >= 10000) return (n / 1000).toFixed(1) + "K"; return Math.round(n).toLocaleString() }
     function refreshIndex() { var s = store.settings.refresh_seconds || 60; return s >= 300 ? 2 : s >= 120 ? 1 : 0 }
     onClosing: function(close) { close.accepted = false; store.handleWindowClose(); win.hide() }
