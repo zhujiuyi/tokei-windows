@@ -6,19 +6,22 @@ Rectangle {
     objectName: "trendCard"
     required property var points
     property int selectedIndex: -1
-    radius: 16
-    color: "#25262d"
-    border.color: "#41424b"
+    radius: 18
+    color: "#1a1e26"
+    border.color: "#2a303b"
+    border.width: 1
+
+    Rectangle { anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; height: 1; color: "#ffffff"; opacity: 0.055 }
 
     ColumnLayout {
         anchors.fill: parent
-        anchors.margins: 16
-        spacing: 8
+        anchors.margins: 18
+        spacing: 10
 
         RowLayout {
             Layout.fillWidth: true
-            Text { text: "每日成本"; color: "#f7f6f8"; font.pixelSize: 12; font.weight: Font.DemiBold; Layout.fillWidth: true }
-            Text { text: root.points.length + " 天"; color: "#9697a0"; font.pixelSize: 10 }
+            Text { text: "每日成本"; color: "#f2f5fa"; font.pixelSize: 13; font.weight: Font.DemiBold; Layout.fillWidth: true }
+            Text { text: root.points.length + " 天"; color: "#8994a4"; font.pixelSize: 10 }
         }
 
         Item {
@@ -42,7 +45,7 @@ Rectangle {
                     var right = width - 8
                     var top = 14
                     var bottom = height - 8
-                    ctx.strokeStyle = "#41424b"
+                    ctx.strokeStyle = "#303743"
                     ctx.lineWidth = 1
                     for (var grid = 0; grid < 4; grid++) {
                         var gy = top + (bottom - top) * grid / 3
@@ -54,7 +57,7 @@ Rectangle {
 
                     ctx.beginPath()
                     ctx.lineWidth = 2.5
-                    ctx.strokeStyle = "#eb8566"
+                    ctx.strokeStyle = "#f09578"
                     for (var k = 0; k < values.length; k++) {
                         var x = left + (right - left) * (values.length === 1 ? 0.5 : k / (values.length - 1))
                         var y = bottom - (bottom - top) * values[k] / maxV
@@ -66,8 +69,8 @@ Rectangle {
                     ctx.lineTo(left, bottom)
                     ctx.closePath()
                     var fill = ctx.createLinearGradient(0, top, 0, bottom)
-                    fill.addColorStop(0, "rgba(235,133,102,0.26)")
-                    fill.addColorStop(1, "rgba(235,133,102,0.01)")
+                    fill.addColorStop(0, "rgba(240,149,120,0.22)")
+                    fill.addColorStop(1, "rgba(240,149,120,0.01)")
                     ctx.fillStyle = fill
                     ctx.fill()
 
@@ -76,11 +79,11 @@ Rectangle {
                         var selectedY = bottom - (bottom - top) * values[root.selectedIndex] / maxV
                         ctx.beginPath()
                         ctx.arc(selectedX, selectedY, 4, 0, Math.PI * 2)
-                        ctx.fillStyle = "#fff1ec"
+                        ctx.fillStyle = "#fff3ed"
                         ctx.fill()
                         ctx.beginPath()
                         ctx.arc(selectedX, selectedY, 7, 0, Math.PI * 2)
-                        ctx.strokeStyle = "rgba(235,133,102,0.72)"
+                        ctx.strokeStyle = "rgba(240,149,120,0.72)"
                         ctx.lineWidth = 2
                         ctx.stroke()
                     }
@@ -119,16 +122,16 @@ Rectangle {
                 x: Math.max(4, Math.min(plot.width - width - 4, chartMouse.mouseX + 12))
                 y: Math.max(3, chartMouse.mouseY - height - 9)
                 radius: 9
-                color: "#ed17181d"
-                border.color: "#8b6157"
+                color: "#f01a1e27"
+                border.color: "#765c55"
 
                 Column {
                     anchors.fill: parent
                     anchors.margins: 8
                     spacing: 3
-                    Text { text: root.selectedIndex >= 0 ? (root.points[root.selectedIndex].date_label || String(root.points[root.selectedIndex].date || "").slice(5)) : ""; color: "#d6d6dc"; font.pixelSize: 9 }
-                    Text { text: root.selectedIndex >= 0 ? "成本  $" + Number(root.points[root.selectedIndex].total_cost || 0).toFixed(2) : ""; color: "#f1b39f"; font.pixelSize: 10; font.weight: Font.Medium }
-                    Text { text: root.selectedIndex >= 0 ? "Token  " + (root.points[root.selectedIndex].tokens_display || "0") : ""; color: "#e6e6ea"; font.pixelSize: 10 }
+                    Text { text: root.selectedIndex >= 0 ? (root.points[root.selectedIndex].date_label || String(root.points[root.selectedIndex].date || "").slice(5)) : ""; color: "#a5afbe"; font.pixelSize: 9 }
+                    Text { text: root.selectedIndex >= 0 ? "成本  $" + Number(root.points[root.selectedIndex].total_cost || 0).toFixed(2) : ""; color: "#f0a487"; font.pixelSize: 10; font.weight: Font.Medium }
+                    Text { text: root.selectedIndex >= 0 ? "Token  " + (root.points[root.selectedIndex].tokens_display || "0") : ""; color: "#e6ebf3"; font.pixelSize: 10 }
                 }
             }
         }
@@ -142,7 +145,7 @@ Rectangle {
                 delegate: Text {
                     required property string modelData
                     text: modelData
-                    color: "#9697a0"
+                    color: "#8994a4"
                     font.pixelSize: 9
                     horizontalAlignment: Text.AlignHCenter
                     Layout.fillWidth: true

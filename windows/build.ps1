@@ -14,6 +14,9 @@ $vsInstall = if (Test-Path -LiteralPath $vswhere) {
 $vcvars = if ($vsInstall) { Join-Path $vsInstall "VC\Auxiliary\Build\vcvars64.bat" } else { "" }
 $deploy = Join-Path $scriptDirectory ".venv\Scripts\pyside6-deploy.exe"
 $python = Join-Path $scriptDirectory ".venv\Scripts\python.exe"
+$manifestFix = Join-Path $scriptDirectory "scripts\apply_nuitka_onefile_manifest_fix.py"
+& $python $manifestFix
+if ($LASTEXITCODE -ne 0) { throw "Nuitka onefile manifest fix failed with exit code $LASTEXITCODE" }
 if (-not $vcvars -or -not (Test-Path -LiteralPath $vcvars)) {
     if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { throw "MSVC x64 environment not found. Install Visual Studio C++ Build Tools." }
     $vcvars = ""

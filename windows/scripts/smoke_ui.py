@@ -40,6 +40,9 @@ def main() -> int:
     store._snapshot = {
         "claude": {
             "ranges": {"today": {"in": 32500, "out": 5700, "cached": 21800, "cost": 0.41}},
+        },
+        "claude_desktop": {
+            "ranges": {"today": {"in": 4200, "out": 900, "cost": 0.13}},
             "q5": 38,
             "q7": 64,
             "qf": 12,
@@ -66,8 +69,8 @@ def main() -> int:
     ]
     store._quota_history = {
         "cycles": [
-            {"tool": "claude", "current": True, "used_pct": 62.0, "tokens": 75200, "tokens_display": "75,200"},
-            {"tool": "codex", "current": False, "used_pct": 41.5, "tokens": 39400, "tokens_display": "39,400"},
+            {"tool": "claude_desktop", "current": True, "used_pct": 62.0, "tokens": 75200, "tokens_display": "75,200"},
+            {"tool": "codex", "current": False, "used_pct": 41.5, "tokens": 39400, "tokens_display": "39,400"}
         ]
     }
     store._last_updated = "2026-09-25 20:00:00"

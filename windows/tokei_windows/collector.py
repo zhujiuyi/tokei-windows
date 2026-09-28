@@ -42,6 +42,7 @@ import json
 import math
 import re
 import sqlite3
+import struct
 import subprocess
 import threading
 import time
@@ -782,7 +783,8 @@ _SCAN_CACHE_FILE = _DEFAULT_SCAN_CACHE_FILE
 _SCAN_CACHE_VERSION = 21
 _SCAN_CACHE_MIGRATABLE_VERSION = 19
 _CODEX_EVENT_CACHE_SUFFIX = ".codex-events"
-_CODEX_PARSER_VERSION = 8
+_CLAUDE_PARSER_VERSION = 3
+_CODEX_PARSER_VERSION = 9
 _CODEX_ACCOUNTING_VERSION = 7
 
 
@@ -1047,6 +1049,8 @@ def ledger_flush():
     try:
         fresh = _load_ledger_from_disk()
         memo = _LEDGER_CACHE["data"]
+        split_migrated = fresh.get("claude_split") == _CLAUDE_SPLIT_MIGRATION
+        stale_claude_memo = split_migrated and memo.get("claude_split") != _CLAUDE_SPLIT_MIGRATION
         memo_qodercli_schema = int(memo.get("qodercli_schema", 0) or 0)
         fresh_qodercli_schema = int(fresh.get("qodercli_schema", 0) or 0)
         if memo_qodercli_schema > fresh_qodercli_schema:
@@ -1054,6 +1058,10 @@ def ledger_flush():
                 memo.get("tools", {}).get("qodercli", {}))
             fresh["qodercli_schema"] = memo_qodercli_schema
         for tool, days in memo.get("tools", {}).items():
+            if tool == "claude" and stale_claude_memo:
+                # 这份内存账本载入于一次性迁移之前:它的 claude 天是「混合」值,
+                # 合并会把迁移减掉的官方份额按旧来源原样加回来 —— 直接以磁盘的迁移后值为准。
+                continue
             stored = fresh["tools"].setdefault(tool, {})
             for dk, day in days.items():
                 kept = stored.get(dk)
@@ -1399,9 +1407,9 @@ def _merge_dashboard_days(cache, key, days):
 
 
 def _empty_claude():
-    ranges = {k: {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0,
-                  "models": {}, "sessions": set()} for k in RANGE_KEYS}
-    return {"ranges": ranges, "cur": {"in": 0, "out": 0, "cr": 0, "cw": 0, "name": "-"}}
+    empty_cur = {"in": 0, "out": 0, "cr": 0, "cw": 0, "name": "-"}
+    return {"ranges": _claude_empty_ranges(), "cur": dict(empty_cur),
+            "desktop_ranges": _claude_empty_ranges(), "desktop_cur": dict(empty_cur)}
 
 
 def _empty_codex():
@@ -1727,20 +1735,252 @@ def _dedupe_claude_events(file_events):
     return selected
 
 
-def scan_claude(bounds, cache):
-    fc = cache.setdefault("claude", {})
+# 两个渠道:键 = 扫描缓存命名空间 + 账本工具键;值 = 是否官方通道(见 _claude_usage 的 official)。
+# claude 用中继/第三方 API(如 OpenCode);claude_desktop 走官方通道,订阅额度读数挂在它上面。
+_CLAUDE_CHANNELS = (("claude", False), ("claude_desktop", True))
+
+# 账本一次性迁移:把 claude 里官方通道的存量份额挪到 claude_desktop。
+# 该值同时是迁移代次 id(落盘键为 claude_split)。降级陷阱:拆分前的旧构建再跑这份账本时,
+# claude 的实时混合值会在高水位合并里胜出,而 claude_desktop 仍带着官方份额 —— 两页会
+# 重复计数;要重跑迁移,须先从 ~/.tokei/ledger.json 删掉 claude_split 键。
+_CLAUDE_SPLIT_MIGRATION = 2
+
+
+def _claude_empty_ranges():
+    return {k: {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0,
+                "models": {}, "model_efforts": {}, "sessions": set()}
+            for k in RANGE_KEYS}
+
+
+def _claude_refresh_aggregates(fc):
+    """重算某渠道每个文件条目的按日聚合(写回缓存条目);返回是否有变化。
+
+    跨文件去重只在本渠道内做 —— 不同渠道的同一逻辑事件不会互相顶掉。
+    """
+    selected = _dedupe_claude_events([(path, event) for path, entry in fc.items()
+                                      for event in entry.get("events", [])])
+    aggregates = {path: {"days": {}, "hours": [0] * 24, "day_hours": {}, "dh": set(),
+                         "proj": entry.get("proj")}
+                  for path, entry in fc.items()}
+    for path, event in selected:
+        dt = parse_ts(event.get("timestamp", ""))
+        if dt is None:
+            continue
+        dt = dt.astimezone()
+        day_key = dt.date().isoformat()
+        aggregate = aggregates[path]
+        if not aggregate["proj"] and event.get("cwd"):
+            aggregate["proj"] = event["cwd"]
+        day = aggregate["days"].setdefault(
+            day_key, {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0,
+                      "models": {}, "model_efforts": {}})
+        day["in"] += event["in"]; day["out"] += event["out"]
+        day["cr"] += event["cr"]; day["cw"] += event["cw"]
+        day["cost"] += event["cost"]
+        model = event.get("model") or "unknown"
+        model_usage = day["models"].setdefault(
+            model, {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0})
+        model_usage["in"] += event["in"]; model_usage["out"] += event["out"]
+        model_usage["cr"] += event["cr"]; model_usage["cw"] += event["cw"]
+        model_usage["cost"] += event["cost"]
+        effort_usage = day["model_efforts"].setdefault(model, {}).setdefault(
+            event.get("effort") or "未记录", {"in": 0, "out": 0, "cr": 0, "cw": 0})
+        effort_usage["in"] += event["in"]; effort_usage["out"] += event["out"]
+        effort_usage["cr"] += event["cr"]; effort_usage["cw"] += event["cw"]
+        amount = _claude_event_total(event)
+        aggregate["hours"][dt.hour] += amount
+        aggregate["day_hours"].setdefault(day_key, [0] * 24)[dt.hour] += amount
+        aggregate["dh"].add(f"{day_key}:{dt.hour}")
     changed = False
-    if (cache.get("_pricing_changed")
-            and _reprice_claude_events(fc, cache.get("_pricing_changed_models") or [])):
-        changed = True
-    B = {k: {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0, "models": {}, "sessions": set()}
-         for k in RANGE_KEYS}
+    for path, aggregate in aggregates.items():
+        entry = fc[path]
+        values = {
+            "days": aggregate["days"], "hours": aggregate["hours"],
+            "day_hours": aggregate["day_hours"], "dh": sorted(aggregate["dh"]),
+            "proj": aggregate["proj"],
+        }
+        for key, value in values.items():
+            if entry.get(key) != value:
+                entry[key] = value
+                changed = True
+    return changed
+
+
+def _claude_live_days(fc, classify, bucket):
+    """某渠道现存日志的按日实时聚合(含项目名与会话数),账本的实时来源。"""
+    live_days = {}
+    day_projects = {}
+    for f, entry in fc.items():
+        proj_name = os.path.basename((entry.get("proj") or "").rstrip("/"))
+        for dk, day in entry.get("days", {}).items():
+            agg = live_days.setdefault(
+                dk, {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0,
+                     "models": {}, "model_efforts": {}})
+            agg["in"] += day["in"]; agg["out"] += day["out"]
+            agg["cr"] += day["cr"]; agg["cw"] += day["cw"]; agg["cost"] += day["cost"]
+            if proj_name:
+                day_projects.setdefault(dk, set()).add(proj_name)
+            for mn, mv in day["models"].items():
+                mm = agg["models"].setdefault(mn, {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0})
+                mm["in"] += mv["in"]; mm["out"] += mv["out"]
+                mm["cr"] += mv["cr"]; mm["cw"] += mv["cw"]; mm["cost"] += mv["cost"]
+            for mn, efforts in (day.get("model_efforts") or {}).items():
+                target_efforts = agg["model_efforts"].setdefault(mn, {})
+                for effort, usage in efforts.items():
+                    target = target_efforts.setdefault(
+                        effort, {"in": 0, "out": 0, "cr": 0, "cw": 0})
+                    for field in ("in", "out", "cr", "cw"):
+                        target[field] += usage.get(field, 0)
+            # 会话数只能来自现存日志(被清日志无从归属)
+            try:
+                d = date.fromisoformat(dk)
+            except ValueError:
+                continue
+            for k in classify(d):
+                bucket[k]["sessions"].add(f)
+    # 项目名随天入账本(list 会被 snapshot 原样存档;_ledger_day_total 只加数值,不受影响),
+    # 日志被清理后回顾页仍能回答"那天在干什么"。
+    for dk, names in day_projects.items():
+        live_days[dk]["projects"] = sorted(names)[:3]
+    return live_days
+
+
+def _claude_channel_into(bucket, tool, fc, live_days, classify):
+    """把某渠道经账本对账后的按日值写进 range 桶。"""
+    for dk, day in ledger_reconcile(tool, live_days, _ledger_file_sources(
+            fc, lambda path, _: os.path.basename(path))).items():
+        try:
+            d = date.fromisoformat(dk)
+        except ValueError:
+            continue
+        for k in classify(d):
+            b = bucket[k]
+            b["in"] += day.get("in", 0); b["out"] += day.get("out", 0)
+            b["cr"] += day.get("cr", 0); b["cw"] += day.get("cw", 0)
+            b["cost"] += day.get("cost", 0.0)
+            for mn, mv in (day.get("models") or {}).items():
+                mm = b["models"].setdefault(mn, {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0})
+                mm["in"] += mv.get("in", 0); mm["out"] += mv.get("out", 0)
+                mm["cr"] += mv.get("cr", 0); mm["cw"] += mv.get("cw", 0)
+                mm["cost"] += mv.get("cost", 0.0)
+            for mn, efforts in (day.get("model_efforts") or {}).items():
+                target_efforts = b["model_efforts"].setdefault(mn, {})
+                for effort, usage in efforts.items():
+                    target = target_efforts.setdefault(
+                        effort, {"in": 0, "out": 0, "cr": 0, "cw": 0})
+                    for field in ("in", "out", "cr", "cw"):
+                        target[field] += usage.get(field, 0)
+
+
+def _claude_current_session(fc, cur_file):
+    """当前会话 = 最近修改的那个文件的所有天之和(按渠道各算一遍)。"""
+    cur = {"in": 0, "out": 0, "cr": 0, "cw": 0,
+           "name": os.path.basename(cur_file)[:8] if cur_file else "-"}
+    entry = fc.get(cur_file) if cur_file else None
+    if entry:
+        for day in entry.get("days", {}).values():
+            cur["in"] += day["in"]; cur["out"] += day["out"]
+            cur["cr"] += day["cr"]; cur["cw"] += day["cw"]
+    return cur
+
+
+def _claude_scan_result(buckets, curs):
+    empty = {"in": 0, "out": 0, "cr": 0, "cw": 0, "name": "-"}
+    return {"ranges": buckets["claude"], "cur": curs.get("claude") or dict(empty),
+            "desktop_ranges": buckets["claude_desktop"],
+            "desktop_cur": curs.get("claude_desktop") or dict(empty)}
+
+
+def _migrate_claude_ledger_split(desktop_days):
+    """一次性迁移:从旧混合存档的 claude 里减掉官方通道份额。
+
+    桌面份额用本次扫描的实测值逐日相减;减法走 _ledger_values(..., subtract=True) ——
+    它会跳过 _sources,于是被改过的天退化为「聚合 + 残差」,随后的正常对账按现存日志
+    重建来源。日志已被清理的天扫不到实测值,份额减不掉,保留在中继渠道(已知偏差)。
+    直接改磁盘并让内存缓存失效,避免 flush 时旧来源把减掉的量又合并回来。
+    hours/model_efforts 由键并集原样保留(不按残差重建),所以迁移当天中继渠道的
+    按小时/按 effort 明细仍含官方份额;天与按模型的 token 数是对的。
+    """
+    if not desktop_days:
+        return False
+    if _load_ledger().get("claude_split") == _CLAUDE_SPLIT_MIGRATION:
+        return False
+    lock_fd = None
+    lock_kind = None
+    try:
+        os.makedirs(os.path.dirname(_LEDGER_FILE), mode=0o700, exist_ok=True)
+        lock_fd = os.open(f"{_LEDGER_FILE}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        lock_kind = _acquire_file_lock(lock_fd)
+    except OSError:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        lock_fd = None
+    try:
+        try:
+            with open(_LEDGER_FILE, encoding="utf-8") as fh:
+                fresh = json.load(fh)
+        except FileNotFoundError:
+            fresh = {"v": _LEDGER_VERSION, "tools": {}}      # 真·没有账本:没东西可迁,但要落标记
+        except (OSError, ValueError):
+            # 文件在、但读不出来(被占用/损坏):不迁移也不落标记,下一轮再试 ——
+            # 绝不能在没读到真实账本时写标记,那会把整份历史换成一份空账本。
+            return False
+        if not isinstance(fresh, dict) or fresh.get("v") != _LEDGER_VERSION:
+            return False
+        if fresh.get("claude_split") == _CLAUDE_SPLIT_MIGRATION:
+            return False
+        days = fresh.setdefault("tools", {}).setdefault("claude", {})
+        for dk, desktop_day in desktop_days.items():
+            stored = days.get(dk)
+            if not isinstance(stored, dict):
+                continue
+            payload = {field: desktop_day.get(field, 0)
+                       for field in ("in", "out", "cr", "cw", "cost")}
+            payload["models"] = desktop_day.get("models") or {}
+            days[dk] = _ledger_values(stored, payload, subtract=True)
+        fresh["claude_split"] = _CLAUDE_SPLIT_MIGRATION
+        _save_ledger(fresh)
+        _LEDGER_CACHE["data"] = None      # 让随后的 reconcile 读到迁移后的账本
+        _LEDGER_CACHE["dirty"] = False
+        return True
+    finally:
+        if lock_fd is not None:
+            try:
+                _release_file_lock(lock_fd, lock_kind)
+            finally:
+                os.close(lock_fd)
+
+
+def scan_claude(bounds, cache):
+    """Claude 一次解析,按响应特征拆成两个渠道。
+
+    - claude        —— 中继/第三方 API 通道(如 OpenCode)
+    - claude_desktop —— 官方通道(订阅/官方 API);订阅额度读数挂在它上面
+    分类只看每条记录自身特征(_claude_usage 的 official),与入口(entrypoint)无关。
+    """
+    file_caches = {key: cache.setdefault(key, {}) for key, _official in _CLAUDE_CHANNELS}
+    # 与渠道无关的「已解析」索引:{文件: [签名, 解析器版本]}。渠道条目只在有事件时存在,
+    # 所以两个渠道都没事件的文件(空会话)必须靠这份索引才不会每轮重读。
+    parse_sigs = cache.setdefault("_claude_parse_sigs", {})
+    changed = False
+    if cache.get("_pricing_changed"):
+        changed_models = cache.get("_pricing_changed_models") or []
+        for fc in file_caches.values():
+            if _reprice_claude_events(fc, changed_models):
+                changed = True
+    buckets = {key: _claude_empty_ranges() for key, _official in _CLAUDE_CHANNELS}
     cur_file, cur_mtime = None, -1.0
     if not os.path.isdir(CLAUDE_DIR):
-        if fc:
-            fc.clear()
+        for fc in file_caches.values():
+            if fc:
+                fc.clear()
+                changed = True
+        if parse_sigs:
+            parse_sigs.clear()
+            changed = True
+        if changed:
             cache["_dirty"] = True
-        return {"ranges": B, "cur": {"in": 0, "out": 0, "cr": 0, "cw": 0, "name": "-"}}
+        return _claude_scan_result(buckets, {})
 
     today_d = bounds["today"].date()
     yest_d = bounds["yesterday"].date()
@@ -1750,7 +1990,7 @@ def scan_claude(bounds, cache):
     month_d = bounds["month"].date()
     year_d = bounds["year"].date()
 
-    stale = set(fc.keys())
+    stale = set().union(*(set(fc) for fc in file_caches.values()))
 
     for f in glob.glob(os.path.join(CLAUDE_DIR, "**", "*.jsonl"), recursive=True):
         stale.discard(f)
@@ -1763,8 +2003,14 @@ def scan_claude(bounds, cache):
             cur_mtime = mtime
             cur_file = f
         sig = f"{mtime}:{size}"
-        entry = fc.get(f)
-        if not entry or entry.get("sig") != sig:
+        entries = [fc.get(f) for fc in file_caches.values()]
+        # 过期判定:解析索引的签名/版本对不上(新文件、内容变了、解析器升级),或任一现存
+        # 渠道条目过期(别的进程写过旧格式)。渠道侧缺条目不算过期 —— 那是「该渠道无事件」的正常态。
+        if (parse_sigs.get(f) != [sig, _CLAUDE_PARSER_VERSION]
+                or any(entry is not None
+                       and (entry.get("sig") != sig
+                            or entry.get("parser_version") != _CLAUDE_PARSER_VERSION)
+                       for entry in entries)):
             events = []
             proj = None
             try:
@@ -1779,75 +2025,47 @@ def scan_claude(bounds, cache):
                             "in": u["in"], "out": u["out"], "cr": u["cr"], "cw": u["cw"],
                             "cw5": u.get("cw5"), "cw1": u.get("cw1"),
                             "cost": u["cost"], "model": u.get("model") or "unknown",
+                            "effort": u.get("effort") or "未记录",
                             "cwd": u.get("cwd"), "mid": u.get("mid"),
                             "request_id": u.get("request_id"), "event_id": u.get("event_id"),
                             "sidechain": bool(u.get("sidechain")), "timestamp": u["dt"].isoformat(),
-                            "line": line_number,
+                            "line": line_number, "official": u.get("official") is True,
                         })
                         if proj is None and u.get("cwd"):
                             proj = u["cwd"]
             except OSError:
                 continue
-            events = [event for _, event in _dedupe_claude_events((f, item) for item in events)]
-            fc[f] = {"sig": sig, "events": events, "proj": proj}
+            split = {}
+            for official in (False, True):
+                own = [event for event in events if event.get("official") is official]
+                if own:
+                    split[official] = [event for _source, event in
+                                       _dedupe_claude_events((f, item) for item in own)]
+            for key, official in _CLAUDE_CHANNELS:
+                own = split.get(official)
+                if own:
+                    file_caches[key][f] = {"sig": sig, "events": own, "proj": proj,
+                                           "parser_version": _CLAUDE_PARSER_VERSION}
+                else:
+                    # 该渠道在本文件无事件:不留空条目(已有条目要删除)。
+                    file_caches[key].pop(f, None)
+            parse_sigs[f] = [sig, _CLAUDE_PARSER_VERSION]
             changed = True
 
-    for p in stale:
-        fc.pop(p, None)
-        changed = True
-
-    all_events = []
-    for path, entry in fc.items():
-        for event in entry.get("events", []):
-            all_events.append((path, event))
-    selected_events = _dedupe_claude_events(all_events)
-
-    aggregates = {
-        path: {"days": {}, "hours": [0] * 24, "day_hours": {}, "dh": set(),
-               "proj": entry.get("proj")}
-        for path, entry in fc.items()
-    }
-    for path, event in selected_events:
-        dt = parse_ts(event.get("timestamp", ""))
-        if dt is None:
-            continue
-        dt = dt.astimezone()
-        day_key = dt.date().isoformat()
-        aggregate = aggregates[path]
-        if not aggregate["proj"] and event.get("cwd"):
-            aggregate["proj"] = event["cwd"]
-        day = aggregate["days"].setdefault(
-            day_key, {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0, "models": {}})
-        day["in"] += event["in"]; day["out"] += event["out"]
-        day["cr"] += event["cr"]; day["cw"] += event["cw"]
-        day["cost"] += event["cost"]
-        model = event.get("model") or "unknown"
-        model_usage = day["models"].setdefault(
-            model, {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0})
-        model_usage["in"] += event["in"]; model_usage["out"] += event["out"]
-        model_usage["cr"] += event["cr"]; model_usage["cw"] += event["cw"]
-        model_usage["cost"] += event["cost"]
-        amount = _claude_event_total(event)
-        aggregate["hours"][dt.hour] += amount
-        aggregate["day_hours"].setdefault(day_key, [0] * 24)[dt.hour] += amount
-        aggregate["dh"].add(f"{day_key}:{dt.hour}")
-
-    for path, aggregate in aggregates.items():
-        entry = fc[path]
-        values = {
-            "days": aggregate["days"], "hours": aggregate["hours"],
-            "day_hours": aggregate["day_hours"], "dh": sorted(aggregate["dh"]),
-            "proj": aggregate["proj"],
-        }
-        for key, value in values.items():
-            if entry.get(key) != value:
-                entry[key] = value
+    for path in stale:
+        if parse_sigs.pop(path, None) is not None:
+            changed = True
+        for fc in file_caches.values():
+            if fc.pop(path, None) is not None:
                 changed = True
+
+    for fc in file_caches.values():
+        if _claude_refresh_aggregates(fc):
+            changed = True
 
     if changed:
         cache["_dirty"] = True
 
-    # Assembly: per-day → range buckets
     def classify(d):
         ks = ["all"]
         if d == today_d: ks.append("today")
@@ -1858,64 +2076,14 @@ def scan_claude(bounds, cache):
         if d >= year_d: ks.append("year")
         return ks
 
-    live_days = {}
-    day_projects = {}
-    for f, entry in fc.items():
-        proj_name = os.path.basename((entry.get("proj") or "").rstrip("/"))
-        for dk, day in entry.get("days", {}).items():
-            agg = live_days.setdefault(
-                dk, {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0, "models": {}})
-            agg["in"] += day["in"]; agg["out"] += day["out"]
-            agg["cr"] += day["cr"]; agg["cw"] += day["cw"]; agg["cost"] += day["cost"]
-            if proj_name:
-                day_projects.setdefault(dk, set()).add(proj_name)
-            for mn, mv in day["models"].items():
-                mm = agg["models"].setdefault(mn, {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0})
-                mm["in"] += mv["in"]; mm["out"] += mv["out"]
-                mm["cr"] += mv["cr"]; mm["cw"] += mv["cw"]; mm["cost"] += mv["cost"]
-            # 会话数只能来自现存日志(被清日志无从归属)
-            try:
-                d = date.fromisoformat(dk)
-            except ValueError:
-                continue
-            for k in classify(d):
-                B[k]["sessions"].add(f)
-    # 项目名随天入账本(list 会被 snapshot 原样存档;_ledger_day_total 只加数值,不受影响),
-    # 日志被清理后回顾页仍能回答"那天在干什么"。
-    for dk, names in day_projects.items():
-        live_days[dk]["projects"] = sorted(names)[:3]
-
-    for dk, day in ledger_reconcile("claude", live_days, _ledger_file_sources(
-            fc, lambda path, _: os.path.basename(path))).items():
-        try:
-            d = date.fromisoformat(dk)
-        except ValueError:
-            continue
-        for k in classify(d):
-            b = B[k]
-            b["in"] += day.get("in", 0); b["out"] += day.get("out", 0)
-            b["cr"] += day.get("cr", 0); b["cw"] += day.get("cw", 0)
-            b["cost"] += day.get("cost", 0.0)
-            for mn, mv in (day.get("models") or {}).items():
-                mm = b["models"].setdefault(mn, {"in": 0, "out": 0, "cr": 0, "cw": 0, "cost": 0.0})
-                mm["in"] += mv.get("in", 0); mm["out"] += mv.get("out", 0)
-                mm["cr"] += mv.get("cr", 0); mm["cw"] += mv.get("cw", 0)
-                mm["cost"] += mv.get("cost", 0.0)
-
-    # Current session: sum all days of the most recently modified file
-    cur_in = cur_out = cur_cr = cur_cw = 0
-    if cur_file:
-        entry = fc.get(cur_file)
-        if entry:
-            for day in entry.get("days", {}).values():
-                cur_in += day["in"]; cur_out += day["out"]
-                cur_cr += day["cr"]; cur_cw += day["cw"]
-
-    return {
-        "ranges": B,
-        "cur": {"in": cur_in, "out": cur_out, "cr": cur_cr, "cw": cur_cw,
-                "name": os.path.basename(cur_file)[:8] if cur_file else "-"},
-    }
+    live = {key: _claude_live_days(file_caches[key], classify, buckets[key])
+            for key, _official in _CLAUDE_CHANNELS}
+    _migrate_claude_ledger_split(live["claude_desktop"])
+    for key, _official in _CLAUDE_CHANNELS:
+        _claude_channel_into(buckets[key], key, file_caches[key], live[key], classify)
+    curs = {key: _claude_current_session(file_caches[key], cur_file)
+            for key, _official in _CLAUDE_CHANNELS}
+    return _claude_scan_result(buckets, curs)
 
 
 def _claude_usage(line, want_dt=False):
@@ -1943,10 +2111,19 @@ def _claude_usage(line, want_dt=False):
     cc = u.get("cache_creation") or {}
     w5 = cc.get("ephemeral_5m_input_tokens")
     w1 = cc.get("ephemeral_1h_input_tokens")
+    mid = msg.get("id")
+    request_id = o.get("requestId") or o.get("request_id")
+    model = msg.get("model")
     res = {"in": inp, "out": out, "cr": cr, "cw": cw, "cw5": w5, "cw1": w1,
-           "model": msg.get("model"), "cwd": o.get("cwd"), "mid": msg.get("id"),
-           "request_id": o.get("requestId") or o.get("request_id"),
-           "event_id": o.get("uuid"), "sidechain": o.get("isSidechain") is True}
+           "effort": o.get("effort") or msg.get("effort") or msg.get("reasoning_effort"),
+           "model": model, "cwd": o.get("cwd"), "mid": mid,
+           "request_id": request_id,
+           "event_id": o.get("uuid"), "sidechain": o.get("isSidechain") is True,
+           # 官方通道(订阅/官方 API)的响应特征:Claude 自家消息 id + 请求 id + claude-* 模型,
+           # 三者缺一即视为经中继/第三方 API 消耗(如 OpenCode),不计入订阅额度。
+           "official": bool(isinstance(mid, str) and mid.startswith("msg_")
+                            and isinstance(request_id, str) and request_id.startswith("req_")
+                            and isinstance(model, str) and model.startswith("claude-"))}
     res["cost"] = _claude_event_cost(res)
     if want_dt:
         res["dt"] = dt
@@ -2795,13 +2972,28 @@ def _reprice_codex_event_caches(file_cache, changed_models, multipliers=None):
 def _codex_day():
     return {"in": 0, "cached": 0, "out": 0, "reason": 0,
             "cost": 0.0, "models": {}, "hours": [0] * 24,
-            "model_hours": {}}
+            "model_hours": {}, "model_efforts": {}}
+
+
+def _codex_add_effort_usage(model_efforts, model, effort, inp=0, out=0,
+                            cached=0, cache_write=0, reason=0):
+    if not model:
+        return
+    usage = model_efforts.setdefault(model, {}).setdefault(
+        str(effort or "未记录"),
+        {"in": 0, "out": 0, "cr": 0, "cw": 0, "reason": 0})
+    usage["in"] += int(inp or 0)
+    usage["out"] += int(out or 0)
+    usage["cr"] += int(cached or 0)
+    usage["cw"] += int(cache_write or 0)
+    usage["reason"] += int(reason or 0)
 
 
 def _codex_add_event(days, event):
     dk = event[1]
     li, lc, lo, lr, _ = event[6:11]
     model = event[11] if len(event) > 11 else None
+    effort = event[13] if len(event) > 13 else "未记录"
     cost = _codex_estimated_cost(model, li, lc, lo)
     day = days.setdefault(dk, _codex_day())
     day["in"] += li
@@ -2810,6 +3002,8 @@ def _codex_add_event(days, event):
     day["reason"] += lr
     day["cost"] += cost
     _add_model_usage(day["models"], model, max(li - lc, 0), lo, lc, 0, lr, cost)
+    _codex_add_effort_usage(day["model_efforts"], model, effort,
+                            max(li - lc, 0), lo, lc, 0, lr)
     try:
         hour = datetime.fromisoformat(event[0]).astimezone().hour
         amount = li + lo
@@ -2851,6 +3045,12 @@ def _codex_split_day(day):
         target["cost"] += cost
         _add_model_usage(target["models"], model, li, lo, lc,
                          usage.get("cw", 0), lr, cost)
+        for effort, effort_usage in ((day.get("model_efforts") or {}).get(model) or {}).items():
+            _codex_add_effort_usage(
+                target["model_efforts"], model, effort,
+                effort_usage.get("in", 0), effort_usage.get("out", 0),
+                effort_usage.get("cr", 0), effort_usage.get("cw", 0),
+                effort_usage.get("reason", 0))
         allocated = model_hours.get(model)
         if isinstance(allocated, list):
             for hour, amount in enumerate(allocated[:24]):
@@ -3184,6 +3384,7 @@ def _codex_probe_record_header(data):
     root_type = None
     payload_type = None
     model = None
+    effort = None
     pending_keys = {}
     containers = []
     payload_depth = None
@@ -3231,6 +3432,8 @@ def _codex_probe_record_header(data):
                     payload_type = value
                 elif key == "model":
                     model = value
+                elif key in ("effort", "reasoning_effort"):
+                    effort = value
             i = lookahead
             continue
 
@@ -3258,12 +3461,12 @@ def _codex_probe_record_header(data):
             pending_keys.pop(depth, None)
         i += 1
 
-    return timestamp, root_type, payload_type, model
+    return timestamp, root_type, payload_type, model, effort
 
 
 def _iter_codex_usage_records(path, chunk_size=64 * 1024, header_limit=1024,
                               model_limit=64 * 1024, start_offset=0, end_offset=None):
-    """Yield model changes and token records without buffering unrelated large JSONL lines."""
+    """Yield model/turn-context changes and token records without buffering unrelated JSONL lines."""
     # Recent permission profiles put payload.model beyond the old 4 KB prefix.
     # Keep model probing bounded so large instructions never require full buffering.
     prefix = bytearray()
@@ -3292,26 +3495,32 @@ def _iter_codex_usage_records(path, chunk_size=64 * 1024, header_limit=1024,
 
                 if kind == "token":
                     candidate.extend(piece)
-                elif kind == "model":
+                elif kind in ("model", "context"):
                     take = min(len(piece), model_limit - len(prefix))
                     prefix.extend(piece[:take])
-                    _, _, _, model = _codex_probe_record_header(prefix)
-                    if model:
+                    _, _, _, model, effort = _codex_probe_record_header(prefix)
+                    if kind == "context" and model and effort:
+                        yield "context", {"model": model, "effort": effort}
+                        prefix = bytearray()
+                        kind = "ignore"
+                    elif kind == "model" and model:
                         yield "model", model
                         prefix = bytearray()
                         kind = "ignore"
                     elif len(prefix) >= model_limit:
+                        if kind == "context" and (model or effort):
+                            yield "context", {"model": model, "effort": effort}
                         prefix = bytearray()
                         kind = "ignore"
                 elif kind is None and len(prefix) < header_limit:
                     take = min(len(piece), header_limit - len(prefix))
                     prefix.extend(piece[:take])
                     if any(marker in prefix for marker in _CODEX_USAGE_RECORD_MARKERS):
-                        timestamp, root_type, payload_type, model = (
+                        timestamp, root_type, payload_type, model, effort = (
                             _codex_probe_record_header(prefix)
                         )
                     else:
-                        timestamp = root_type = payload_type = model = None
+                        timestamp = root_type = payload_type = model = effort = None
                     if timestamp and (root_type == "token_usage_record" or
                             (root_type == "event_msg" and payload_type in ("token_count", "task_started"))):
                         candidate = prefix
@@ -3320,12 +3529,16 @@ def _iter_codex_usage_records(path, chunk_size=64 * 1024, header_limit=1024,
                         if take < len(piece):
                             candidate.extend(piece[take:])
                     elif timestamp and root_type in _CODEX_MODEL_RECORD_TYPES:
-                        kind = "model"
+                        kind = "context" if root_type == "turn_context" else "model"
                         if take < len(piece):
                             extra = min(len(piece) - take, model_limit - len(prefix))
                             prefix.extend(piece[take:take + extra])
-                        _, _, _, model = _codex_probe_record_header(prefix)
-                        if model:
+                        _, _, _, model, effort = _codex_probe_record_header(prefix)
+                        if kind == "context" and model and effort:
+                            yield "context", {"model": model, "effort": effort}
+                            prefix = bytearray()
+                            kind = "ignore"
+                        elif kind == "model" and model:
                             yield "model", model
                             prefix = bytearray()
                             kind = "ignore"
@@ -3343,6 +3556,10 @@ def _iter_codex_usage_records(path, chunk_size=64 * 1024, header_limit=1024,
                 if newline < 0:
                     break
 
+                if kind == "context":
+                    _, _, _, model, effort = _codex_probe_record_header(prefix)
+                    if model or effort:
+                        yield "context", {"model": model, "effort": effort}
                 if candidate is not None:
                     yield "token", bytes(candidate)
                 prefix = bytearray()
@@ -3350,6 +3567,10 @@ def _iter_codex_usage_records(path, chunk_size=64 * 1024, header_limit=1024,
                 kind = None
                 start = newline + 1
 
+    if kind == "context":
+        _, _, _, model, effort = _codex_probe_record_header(prefix)
+        if model or effort:
+            yield "context", {"model": model, "effort": effort}
     if candidate is not None:
         yield "token", bytes(candidate)
 
@@ -3525,7 +3746,7 @@ def scan_codex(bounds, cache):
                 cache.get("_pricing_cost_multipliers") or {})):
         cache["_dirty"] = True
     B = {k: {"in": 0, "cached": 0, "out": 0, "reason": 0, "cost": 0.0,
-             "sessions": set(), "models": {}}
+             "sessions": set(), "models": {}, "model_efforts": {}}
          for k in RANGE_KEYS}
     rollout_files = _codex_rollout_files()
     today_d = bounds["today"].date()
@@ -3590,6 +3811,7 @@ def scan_codex(bounds, cache):
                 file_last_total = None
                 prev_total_key = None
                 file_model = None
+                file_effort = None
                 response_ids = set()
                 pending_responses = []
                 last_legacy_snapshot = None
@@ -3607,6 +3829,7 @@ def scan_codex(bounds, cache):
                 previous = entry.get("prev_total_key")
                 prev_total_key = tuple(previous) if isinstance(previous, (list, tuple)) else None
                 file_model = entry.get("active_model")
+                file_effort = entry.get("active_effort")
                 response_ids = set(entry.get("response_ids") or [])
                 pending_responses = list(entry.get("pending_responses") or [])
                 last_legacy_snapshot = entry.get("last_legacy_snapshot")
@@ -3617,6 +3840,11 @@ def scan_codex(bounds, cache):
                         f, start_offset=parse_start, end_offset=complete_offset):
                     if record_kind == "model":
                         file_model = record
+                        continue
+                    if record_kind == "context":
+                        if record.get("model"):
+                            file_model = record["model"]
+                        file_effort = record.get("effort")
                         continue
                     try:
                         o = json.loads(record.decode("utf-8", errors="ignore"))
@@ -3726,7 +3954,8 @@ def scan_codex(bounds, cache):
                         totals = total_key if total_key is not None else (None, None, None, None)
                         # timestamp, local day, cumulative usage, incremental usage, cost
                         if li or lc or lo or lr:
-                            events.append([ts.isoformat(), dk, *totals, li, lc, lo, lr, cost, model, response_id])
+                            events.append([ts.isoformat(), dk, *totals, li, lc, lo, lr,
+                                           cost, model, response_id, file_effort or "未记录"])
             except OSError:
                 continue
 
@@ -3774,7 +4003,8 @@ def scan_codex(bounds, cache):
                 "g_limits": file_g_limits, "g_ts": file_g_ts, "g_plan": file_g_plan,
                 "reserve_limits": file_r_limits, "reserve_limits_ts": file_r_ts,
                 "last_total": file_last_total, "prev_total_key": prev_total_key,
-                "active_model": file_model, "parser_version": _CODEX_PARSER_VERSION,
+                "active_model": file_model, "active_effort": file_effort,
+                "parser_version": _CODEX_PARSER_VERSION,
                 "accounting_version": _CODEX_ACCOUNTING_VERSION,
                 "response_ids": sorted(response_ids), "pending_responses": pending_responses,
                 "last_legacy_snapshot": last_legacy_snapshot,
@@ -3910,12 +4140,19 @@ def scan_codex(bounds, cache):
                         usage.get("out", 0), usage.get("cr", 0),
                         usage.get("cw", 0), usage.get("reason", 0),
                         usage.get("cost", 0))
+                for model, efforts in (day.get("model_efforts") or {}).items():
+                    for effort, usage in efforts.items():
+                        _codex_add_effort_usage(
+                            bucket["model_efforts"], model, effort,
+                            usage.get("in", 0), usage.get("out", 0),
+                            usage.get("cr", 0), usage.get("cw", 0),
+                            usage.get("reason", 0))
 
     _assemble_codex_ranges(B, merged_days, main_sessions)
 
     # Reserve is independently attributed down to source, session, day and hour.
     RB = {k: {"in": 0, "cached": 0, "out": 0, "reason": 0, "cost": 0.0,
-              "sessions": set(), "models": {}}
+              "sessions": set(), "models": {}, "model_efforts": {}}
           for k in RANGE_KEYS}
     _assemble_codex_ranges(RB, merged_reserve_days, reserve_sessions)
 
@@ -12168,7 +12405,10 @@ CLAUDE_CACHE = os.path.join(
 CLAUDE_CACHE_DIRS = _path_candidates(
     "TOKEI_CLAUDE_CACHE_DIR", CLAUDE_CACHE,
     os.path.join(APPDATA, "Claude", "Cache", "Cache_Data"),
-    os.path.join(LOCALAPPDATA, "Claude", "Cache", "Cache_Data"))
+    os.path.join(LOCALAPPDATA, "Claude", "Cache", "Cache_Data"),
+    # MSIX 版的 AppData 实际落在包目录,包外不一定能从 %APPDATA% 看到。
+    *glob.glob(os.path.join(LOCALAPPDATA, "Packages", "Claude_*", "LocalCache",
+                            "Roaming", "Claude", "Cache", "Cache_Data")))
 
 
 def _claude_cache_records():
@@ -12259,7 +12499,12 @@ def _parse_claude_quota_record(record):
     pos = data.find(_ZSTD_MAGIC)
     if pos < 0:
         return None
-    raw = _zstd_decompress(data[pos:])
+    return _claude_quota_from_body(data[pos:], int(record["mtime_ns"] // 1_000_000_000))
+
+
+def _claude_quota_from_body(body, updated):
+    """/usage 响应体(zstd 或未压缩)→ 额度快照;不是有效的 /usage 响应就返回 None。"""
+    raw = _zstd_decompress(body) if body.startswith(_ZSTD_MAGIC) else body
     if not raw:
         return None
     try:
@@ -12293,7 +12538,7 @@ def _parse_claude_quota_record(record):
         "q7_reset": _iso_to_epoch(seven_day.get("resets_at")),
         "qf": fable_limit.get("percent"),
         "qf_reset": _iso_to_epoch(fable_limit.get("resets_at")),
-        "q_updated": int(record["mtime_ns"] // 1_000_000_000),
+        "q_updated": updated,
     }
     return result if any(result[key] is not None for key in ("q5", "q7", "qf")) else None
 
@@ -12441,8 +12686,148 @@ def _scan_claude_plan_raw(now=None):
     return _claude_quota_with_freshness(snapshot, now=now)
 
 
+# Windows 版 Claude Desktop 的缓存是 Chromium blockfile 格式(index + data_N + f_xxxxxx),
+# 不是 macOS 的 simple cache(每条一个 <hash>_0),上面按 *_0 逐文件找只会碰到 data_0。
+# 条目 EntryStore(256B)放在块大小 256 的 data_N 里:+20 state、+32 key_len、+36 long_key、
+# +40 data_size[4]、+56 data_addr[4]、+96 key;stream0 是响应头,stream1 是响应体。
+_BLOCKFILE_MAGIC = 0xC104CAC3
+_BLOCKFILE_HEADER_SIZE = 8192
+_BLOCKFILE_BITMAP_OFFSET = 80
+_BLOCKFILE_ENTRY_SIZE = 256
+_BLOCKFILE_MAX_KEY = 4 * _BLOCKFILE_ENTRY_SIZE - 96 - 1
+_BLOCKFILE_BLOCK_SIZES = {2: 256, 3: 1024, 4: 4096}
+_CLAUDE_USAGE_KEY = re.compile(
+    rb"https://claude\.ai/api/organizations/[0-9A-Fa-f-]{36}/usage(?:\?[^\x00]*)?$")
+_HTTP_STATUS = re.compile(rb"HTTP/[0-9.]+ ([0-9]{3})")
+_HTTP_DATE = re.compile(rb"\x00date:[ \t]*([^\x00]+)", re.IGNORECASE)
+
+
+def _read_shared(path, offset=0, size=-1):
+    """只读打开,并允许别的进程带 DELETE 权限持有同一文件。
+
+    Chromium 以含 DELETE 的权限打开缓存文件;CRT 的 open() 不带 FILE_SHARE_DELETE,
+    会被判为共享冲突(PermissionError),所以 Windows 上改走 CreateFileW。
+    """
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = (
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        # GENERIC_READ,FILE_SHARE_READ | WRITE | DELETE,OPEN_EXISTING
+        handle = kernel32.CreateFileW(path, 0x80000000, 0x7, None, 3, 0, None)
+        if handle in (None, wintypes.HANDLE(-1).value):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        except OSError:
+            kernel32.CloseHandle(handle)
+            raise
+        fh = open(fd, "rb")
+    else:
+        fh = open(path, "rb")
+    with fh:
+        fh.seek(offset)
+        return fh.read(size)
+
+
+def _blockfile_stream(cache_dir, addr, size):
+    """按 CacheAddr 读一条流:外部文件 f_xxxxxx,或 data_N 里从起始块开始的连续块。"""
+    if not addr & 0x80000000 or not 0 < size <= _CLAUDE_CACHE_FILE_LIMIT:
+        return None
+    file_type = (addr >> 28) & 0x7
+    if file_type == 0:
+        path, offset = os.path.join(cache_dir, "f_%06x" % (addr & 0x0FFFFFFF)), 0
+    else:
+        block_size = _BLOCKFILE_BLOCK_SIZES.get(file_type)
+        if not block_size or size > (((addr >> 24) & 0x3) + 1) * block_size:
+            return None
+        path = os.path.join(cache_dir, "data_%d" % ((addr >> 16) & 0xFF))
+        offset = _BLOCKFILE_HEADER_SIZE + (addr & 0xFFFF) * block_size
+    data = _read_shared(path, offset, size)
+    return data if len(data) == size else None
+
+
+def _claude_blockfile_usage_bodies(cache_dir):
+    """blockfile 缓存里仍然有效的 /usage 条目 → [(响应 Date 的 epoch, 响应体)]。"""
+    from email.utils import parsedate_to_datetime
+    found = []
+    for path in glob.glob(os.path.join(cache_dir, "data_*")):
+        try:
+            header = _read_shared(path, 0, _BLOCKFILE_HEADER_SIZE)
+            if len(header) < _BLOCKFILE_HEADER_SIZE:
+                continue
+            magic, _version, _this, _next, entry_size = struct.unpack_from("<IIhhi", header)
+            if magic != _BLOCKFILE_MAGIC or entry_size != _BLOCKFILE_ENTRY_SIZE:
+                continue
+            data = _read_shared(path)
+        except OSError:
+            continue
+        blocks = min((len(data) - _BLOCKFILE_HEADER_SIZE) // _BLOCKFILE_ENTRY_SIZE,
+                     (_BLOCKFILE_HEADER_SIZE - _BLOCKFILE_BITMAP_OFFSET) * 8)
+        for block in range(blocks):
+            # 释放的块不会清零,只认分配位图里仍占用的条目
+            if not data[_BLOCKFILE_BITMAP_OFFSET + block // 8] >> (block % 8) & 1:
+                continue
+            entry = _BLOCKFILE_HEADER_SIZE + block * _BLOCKFILE_ENTRY_SIZE
+            state = struct.unpack_from("<i", data, entry + 20)[0]
+            key_len, long_key = struct.unpack_from("<iI", data, entry + 32)
+            if state != 0 or long_key or not 0 < key_len <= _BLOCKFILE_MAX_KEY:
+                continue
+            if not _CLAUDE_USAGE_KEY.search(data[entry + 96:entry + 96 + key_len]):
+                continue
+            sizes = struct.unpack_from("<4i", data, entry + 40)
+            addrs = struct.unpack_from("<4I", data, entry + 56)
+            try:
+                head = _blockfile_stream(cache_dir, addrs[0], sizes[0]) or b""
+                body = _blockfile_stream(cache_dir, addrs[1], sizes[1])
+            except OSError:
+                continue
+            status = _HTTP_STATUS.search(head)
+            date = _HTTP_DATE.search(head)
+            if not body or not status or status.group(1) != b"200" or not date:
+                continue
+            try:
+                fetched = parsedate_to_datetime(date.group(1).decode("latin-1").strip())
+            except (TypeError, ValueError):
+                continue
+            found.append((int(fetched.timestamp()), body))
+    return found
+
+
+def _scan_claude_plan_blockfile(now=None):
+    """Windows:取 blockfile 缓存里最新的一条 /usage;一时读不到就沿用上次的快照。"""
+    cache_dirs = [
+        path for path in _existing_dirs(
+            _path_candidates("TOKEI_CLAUDE_CACHE_DIR", CLAUDE_CACHE, *CLAUDE_CACHE_DIRS))
+        if os.path.isfile(os.path.join(path, "index"))
+    ]
+    if not cache_dirs:
+        return None
+    entries = [entry for cache_dir in cache_dirs
+               for entry in _claude_blockfile_usage_bodies(cache_dir)]
+    latest = None
+    for fetched, body in sorted(entries, key=lambda entry: entry[0], reverse=True):
+        latest = _claude_quota_from_body(body, fetched)
+        if latest:
+            break
+    state = _load_claude_quota_state()
+    if latest:
+        if state.get("blockfile_snapshot") != latest:
+            state["blockfile_snapshot"] = latest
+            _save_claude_quota_state(state)
+    elif isinstance(state.get("blockfile_snapshot"), dict):
+        latest = state["blockfile_snapshot"]
+    return _claude_quota_with_freshness(latest, now=now) if latest else None
+
+
 def scan_claude_plan():
-    return _claude_quota_from_environment() or _scan_claude_plan_raw()
+    return (_claude_quota_from_environment() or _scan_claude_plan_blockfile()
+            or _scan_claude_plan_raw())
 
 
 @_with_scan_cache_lock
@@ -12496,11 +12881,13 @@ def compute():
         models = []
         for n, v in sorted(b["models"].items(), key=lambda kv: -kv[1]["cost"]):
             p = price_for(n)
-            models.append({"name": nice_model(n), "in": v["in"], "out": v["out"],
+            models.append({"model_id": _model_identity_id(n), "name": nice_model(n),
+                           "in": v["in"], "out": v["out"],
                            "cr": v["cr"], "cw": v["cw"], "cost": v["cost"],
                            "pin": p["in"], "pout": p["out"]})
         return {"hit": hit, "in": b["in"], "out": b["out"],
                 "cr": b["cr"], "cw": b["cw"], "cost": b["cost"], "models": models,
+                "model_efforts": _format_model_effort_details(b.get("model_efforts")),
                 "sessions": len(b["sessions"])}
 
     def codex_range(b):
@@ -12508,7 +12895,9 @@ def compute():
         hit = (b.get("cached", 0) / b["in"] * 100) if b.get("in") else 0.0
         return {"hit": hit, "in": b.get("in", 0) - b.get("cached", 0), "cached": b.get("cached", 0),
                 "out": b.get("out", 0), "reason": b.get("reason", 0), "cost": b.get("cost", 0.0),
-                "sessions": len(b.get("sessions", set())), "models": _format_token_models(b.get("models", {}))}
+                "sessions": len(b.get("sessions", set())),
+                "models": _format_token_models(b.get("models", {})),
+                "model_efforts": _format_model_effort_details(b.get("model_efforts", {}))}
 
     def gemini_range(b):
         # tokens.input 含 cached,展示口径与 Codex 一致:输入=非缓存部分
@@ -12567,6 +12956,7 @@ def compute():
                 "ctx": ctx, "duration": b.get("duration", 0)}
 
     cranges = {k: claude_range(cc["ranges"][k]) for k in RANGE_KEYS}
+    cdranges = {k: claude_range(cc["desktop_ranges"][k]) for k in RANGE_KEYS}
     xranges = {k: codex_range(cx["ranges"][k]) for k in RANGE_KEYS}
     xreserveranges = {k: codex_range(cx.get("reserve_ranges", {}).get(k, {}))
                       for k in RANGE_KEYS}
@@ -12648,6 +13038,9 @@ def compute():
 
     cur = cc["cur"]
     cur_total = cur["in"] + cur["out"] + cur["cr"] + cur["cw"]
+    desktop_cur = cc["desktop_cur"]
+    desktop_cur_total = (desktop_cur["in"] + desktop_cur["out"]
+                         + desktop_cur["cr"] + desktop_cur["cw"])
 
     quota = _codex_quota_values(cx["limits"], consumed=cx.get("limits_consumed"))
     p5, pw = quota["p5"], quota["pw"]
@@ -12689,6 +13082,11 @@ def compute():
         "claude": {
             "ranges": cranges,
             "session_name": cur["name"], "session_total": cur_total,
+        },
+        # 官方通道(订阅/官方 API):订阅读数只挂在这里,中继通道没有订阅计划。
+        "claude_desktop": {
+            "ranges": cdranges,
+            "session_name": desktop_cur["name"], "session_total": desktop_cur_total,
             "q5": plan.get("q5"), "q5_reset": plan.get("q5_reset"),
             "q7": plan.get("q7"), "q7_reset": plan.get("q7_reset"),
             "qf": plan.get("qf"), "qf_reset": plan.get("qf_reset"),
@@ -13548,7 +13946,7 @@ def build_daily_costs(period="all", refresh=True, _cache=None):
         per_tool = live_tool_tokens.setdefault(dk, {})
         per_tool[tool] = per_tool.get(tool, 0) + amount
 
-    _empty = lambda: {"claude": 0.0, "codex": 0.0, "codex_reserve": 0.0,
+    _empty = lambda: {"claude": 0.0, "claude_desktop": 0.0, "codex": 0.0, "codex_reserve": 0.0,
                        "gemini": 0.0, "grok": 0.0,
                        "zcode": 0.0, "mimocode": 0.0, "devin": 0.0, "pi": 0.0,
                        "workbuddy": 0.0, "workbuddy_ai": 0.0, "codebuddy": 0.0,
@@ -13558,6 +13956,7 @@ def build_daily_costs(period="all", refresh=True, _cache=None):
                        "prime_agent": 0.0,
                        "hermes": 0.0, "openclaw": 0.0,
                        "c_in": 0, "c_out": 0, "c_cr": 0, "c_cw": 0,
+                       "cd_in": 0, "cd_out": 0, "cd_cr": 0, "cd_cw": 0,
                        "x_in": 0, "x_out": 0, "x_cached": 0, "x_reason": 0,
                        "xr_in": 0, "xr_out": 0, "xr_cached": 0, "xr_reason": 0,
                        "p_in": 0, "p_out": 0, "p_cr": 0, "p_cw": 0, "p_reason": 0,
@@ -13585,6 +13984,26 @@ def build_daily_costs(period="all", refresh=True, _cache=None):
             for mn, mv in day.get("models", {}).items():
                 nm = nice_model(mn)
                 m = models.setdefault(nm, {"cost": 0.0, "in": 0, "out": 0, "cr": 0, "cw": 0, "tool": "claude"})
+                m["cost"] += mv.get("cost", 0)
+                m["in"] += mv.get("in", 0); m["out"] += mv.get("out", 0)
+                m["cr"] += mv.get("cr", 0); m["cw"] += mv.get("cw", 0)
+
+    for fp, entry in cache.get("claude_desktop", {}).items():
+        for dk, day in entry.get("days", {}).items():
+            if cutoff and dk < cutoff:
+                continue
+            d = days.setdefault(dk, _empty())
+            d["claude_desktop"] += day.get("cost", 0)
+            d["cd_in"] += day.get("in", 0); d["cd_out"] += day.get("out", 0)
+            d["cd_cr"] += day.get("cr", 0); d["cd_cw"] += day.get("cw", 0)
+            _add_day_tokens(d, dk, "claude_desktop",
+                            day.get("in", 0) + day.get("out", 0) + day.get("cr", 0) + day.get("cw", 0))
+            d["sessions"] += 1
+            for mn, mv in day.get("models", {}).items():
+                # 中继通道的模型名保持原样,官方通道加后缀,避免同一模型两行混在一起。
+                nm = f"{nice_model(mn)} (Claude Desktop)"
+                m = models.setdefault(nm, {"cost": 0.0, "in": 0, "out": 0, "cr": 0, "cw": 0,
+                                          "tool": "claude_desktop"})
                 m["cost"] += mv.get("cost", 0)
                 m["in"] += mv.get("in", 0); m["out"] += mv.get("out", 0)
                 m["cr"] += mv.get("cr", 0); m["cw"] += mv.get("cw", 0)
@@ -13927,7 +14346,8 @@ def build_daily_costs(period="all", refresh=True, _cache=None):
     # tokens 列只补"账本白名单token(_ledger_token_sum) 超出该工具当日实时token"的差额。
     # 输出结构保持完全不变(qoderwork/qoder_ide/qodercli 无成本列,只参与 token 合并)。
     _LEDGER_COST_COLUMNS = frozenset((
-        "claude", "codex", "codex_reserve", "gemini", "grok", "hermes", "openclaw", "zcode",
+        "claude", "claude_desktop", "codex", "codex_reserve", "gemini", "grok", "hermes",
+        "openclaw", "zcode",
         "mimocode", "devin", "pi", "workbuddy", "workbuddy_ai", "codebuddy", "deepseek_harness",
         "opencode", "qwencode", "musecode", "cmdcode"))
     for tool, tool_days in _load_ledger().get("tools", {}).items():
@@ -13976,7 +14396,8 @@ def build_daily_costs(period="all", refresh=True, _cache=None):
             "tool": "codex_reserve",
         }
 
-    daily = [{"date": dk, "claude": round(v["claude"], 2), "codex": round(v["codex"], 2),
+    daily = [{"date": dk, "claude": round(v["claude"], 2), "claude_desktop": round(v["claude_desktop"], 2),
+              "codex": round(v["codex"], 2),
               "codex_reserve": round(v["codex_reserve"], 2),
               "gemini": round(v["gemini"], 2), "grok": round(v["grok"], 2),
               "hermes": round(v["hermes"], 2),
@@ -13992,7 +14413,7 @@ def build_daily_costs(period="all", refresh=True, _cache=None):
               "musecode": round(v["musecode"], 2),
               "cmdcode": round(v["cmdcode"], 2),
               "prime_agent": round(v["prime_agent"], 2),
-              "total": round(v["claude"] + v["codex"] + v["codex_reserve"]
+              "total": round(v["claude"] + v["claude_desktop"] + v["codex"] + v["codex_reserve"]
                              + v["gemini"] + v["grok"] + v["zcode"]
                              + v["mimocode"] + v["pi"] + v["workbuddy"] + v["workbuddy_ai"]
                              + v["codebuddy"]
@@ -14000,6 +14421,8 @@ def build_daily_costs(period="all", refresh=True, _cache=None):
                              + v["kimicode"] + v["musecode"] + v["cmdcode"] + v["prime_agent"] + v["hermes"]
                              + v["openclaw"] + v["devin"], 2),
               "c_in": v["c_in"], "c_out": v["c_out"], "c_cr": v["c_cr"], "c_cw": v["c_cw"],
+              "cd_in": v["cd_in"], "cd_out": v["cd_out"],
+              "cd_cr": v["cd_cr"], "cd_cw": v["cd_cw"],
               "x_in": v["x_in"], "x_out": v["x_out"], "x_cached": v["x_cached"], "x_reason": v["x_reason"],
               "xr_in": v["xr_in"], "xr_out": v["xr_out"],
               "xr_cached": v["xr_cached"], "xr_reason": v["xr_reason"],
@@ -14149,29 +14572,30 @@ def build_wrapped(period="all", refresh=True, _cache=None):
             if amount:
                 all_day_hours.add(f"{day_key}:{hour}")
 
-    # --- Claude (有 hours / proj / models) ---
-    fc = cache.get("claude", {})
-    for f, entry in fc.items():
-        if not isinstance(entry, dict):
-            continue
-        for day_key, day_hours in entry.get("day_hours", {}).items():
-            if not cutoff or day_key >= cutoff:
-                add_hours(day_key, day_hours)
-        proj_path = entry.get("proj") or ""
-        proj = os.path.basename(proj_path.rstrip("/")) or "?"
-        for dk, day in entry.get("days", {}).items():
-            if cutoff and dk < cutoff:
+    # --- Claude (有 hours / proj / models);两个渠道各跑一遍,中继名保持原样 ---
+    for cache_key, suffix in (("claude", ""), ("claude_desktop", " (Claude Desktop)")):
+        fc = cache.get(cache_key, {})
+        for f, entry in fc.items():
+            if not isinstance(entry, dict):
                 continue
-            tok = token_total(day)
-            day_tokens[dk] = day_tokens.get(dk, 0) + tok
-            day_cost[dk] = day_cost.get(dk, 0.0) + day.get("cost", 0)
-            pt = proj_tok.setdefault(proj, [0, 0.0])
-            pt[0] += tok; pt[1] += day.get("cost", 0)
-            day_projs.setdefault(dk, set()).add(proj)
-            weekday[date.fromisoformat(dk).weekday()] += tok
-            for mn, mv in day.get("models", {}).items():
-                nm = nice_model(mn)
-                model_tok[nm] = model_tok.get(nm, 0) + token_total(mv)
+            for day_key, day_hours in entry.get("day_hours", {}).items():
+                if not cutoff or day_key >= cutoff:
+                    add_hours(day_key, day_hours)
+            proj_path = entry.get("proj") or ""
+            proj = os.path.basename(proj_path.rstrip("/")) or "?"
+            for dk, day in entry.get("days", {}).items():
+                if cutoff and dk < cutoff:
+                    continue
+                tok = token_total(day)
+                day_tokens[dk] = day_tokens.get(dk, 0) + tok
+                day_cost[dk] = day_cost.get(dk, 0.0) + day.get("cost", 0)
+                pt = proj_tok.setdefault(proj, [0, 0.0])
+                pt[0] += tok; pt[1] += day.get("cost", 0)
+                day_projs.setdefault(dk, set()).add(proj)
+                weekday[date.fromisoformat(dk).weekday()] += tok
+                for mn, mv in day.get("models", {}).items():
+                    nm = f"{nice_model(mn)}{suffix}"
+                    model_tok[nm] = model_tok.get(nm, 0) + token_total(mv)
 
     # --- Codex + Luna Reserve (in includes cached; out includes reasoning) ---
     for reserve, suffix in ((False, "Codex"), (True, "Codex Reserve")):
@@ -14683,7 +15107,10 @@ _QUOTA_ANCHOR_FILE = os.path.join(HOME, ".tokei", "quota_cycles.json")
 _QUOTA_ANCHOR_JITTER = 120
 _QUOTA_CYCLE_MIN_USED_PCT = 2
 # 有周额度窗口的三个工具 → 日表里的短键。
-_QUOTA_TOOLS = (("claude", "c"), ("codex", "x"), ("grok", "g"))
+# 订阅额度属于官方通道:工具键是 claude_desktop,不是混合口径的 claude。
+_QUOTA_TOOLS = (("claude_desktop", "cd"), ("codex", "x"), ("grok", "g"))
+# 旧版本 peer 的额度读数与锚点还挂在 claude 键上,读到要认。
+_QUOTA_TOOL_ALIASES = {"claude": "claude_desktop"}
 
 
 def _quota_local_day_range(day_key):
@@ -14736,7 +15163,8 @@ def _quota_day_tokens(tool, entry):
     """一天的 token 数。三个工具口径不同,别混。"""
     if not isinstance(entry, dict):
         return 0
-    if tool == "claude":
+    if tool == "claude_desktop":
+        # T4 之前的 peer 账本日表是混合口径(中继+官方),归不到渠道,按规格一律不计。
         return sum(int(entry.get(k, 0) or 0) for k in ("in", "out", "cr", "cw"))
     if tool == "codex":
         # 账本里的 codex "in" 已含 cached(与 ranges 相反,那边 in 是未缓存部分),
@@ -14748,7 +15176,7 @@ def _quota_day_tokens(tool, entry):
 
 
 def _quota_daily_from_tools(tools):
-    """账本日表 → {日: {"c": …, "x": …, "g": …}}。"""
+    """账本日表 → {日: {"cd": …, "x": …, "g": …}}。"""
     out = {}
     for tool, key in _QUOTA_TOOLS:
         for day, entry in (tools.get(tool) or {}).items():
@@ -14789,9 +15217,9 @@ def _quota_day_hour_bounds(day_key, start, end):
     return lo_hour, max(hi_hour, lo_hour + 1)
 
 
-def _quota_claude_events(cache=None):
+def _quota_claude_events(cache=None, cache_key="claude_desktop"):
     """去重后的 Claude 事件 → [(epoch, 本地日, tokens)]。去重逻辑与 scan_claude 一致。"""
-    file_cache = (cache if cache is not None else _load_scan_cache()).get("claude") or {}
+    file_cache = (cache if cache is not None else _load_scan_cache()).get(cache_key) or {}
     all_events = []
     for path, entry in file_cache.items():
         if isinstance(entry, dict):
@@ -14887,16 +15315,20 @@ def _quota_window_tokens(devices, tool, key, start, end, self_events):
 
 def _quota_tool_reading(source, tool):
     """从一份 payload/同步快照里取 (used_pct, reset_epoch, 读数时间);取不到返回 None。"""
-    data = (source or {}).get(tool) or {}
-    if tool == "claude":
+    source = source or {}
+    if tool == "claude_desktop":
+        # 新版本把订阅读数放在 claude_desktop;旧版本 peer 还在 claude 键上。
+        data = source.get("claude_desktop") or source.get("claude") or {}
         if data.get("q7_stale"):
             return None
         used, reset, updated = data.get("q7"), data.get("q7_reset"), data.get("q_updated")
     elif tool == "codex":
+        data = source.get(tool) or {}
         if data.get("pw_stale"):
             return None
         used, reset, updated = data.get("pw"), data.get("rw"), data.get("q_updated")
     else:
+        data = source.get(tool) or {}
         # Grok 也可能是月套餐,月窗口长度不定又没有数据可验证,先只认周。
         if data.get("stale") or data.get("window") != "week":
             return None
@@ -14974,6 +15406,19 @@ def _record_quota_anchor(anchors, tool, reset, used, now, confirmed_reset=False)
     return True
 
 
+def _rename_legacy_quota_anchors(anchors):
+    """旧锚点是按 claude 记的,搬到 claude_desktop;幂等,返回是否有改动。"""
+    changed = False
+    for legacy, current in _QUOTA_TOOL_ALIASES.items():
+        rows = anchors.get(legacy)
+        if isinstance(rows, list) and rows and not anchors.get(current):
+            anchors[current] = rows
+        if legacy in anchors:
+            anchors.pop(legacy)
+            changed = True
+    return changed
+
+
 def _merge_quota_anchors(anchors, incoming):
     """把 peer 快照里的锚点并进内存表 —— 只为渲染,不回写自己的账。
 
@@ -14982,6 +15427,7 @@ def _merge_quota_anchors(anchors, incoming):
     """
     known = {tool for tool, _key in _QUOTA_TOOLS}
     for tool, rows in (incoming or {}).items():
+        tool = _QUOTA_TOOL_ALIASES.get(tool, tool)
         if tool not in known or not isinstance(rows, list):
             continue
         for row in rows:
@@ -15040,7 +15486,7 @@ def _quota_cycle_specs(payload, devices, peer_anchors, now):
     反复回写成自己的观测。
     """
     anchors = _load_quota_anchors()
-    dirty = False
+    dirty = _rename_legacy_quota_anchors(anchors)
     for tool, _key in _QUOTA_TOOLS:
         for _name, _tools, snapshot, _daily in devices:
             reading = _quota_tool_reading(snapshot if snapshot else payload, tool)
@@ -15105,7 +15551,8 @@ def build_quota_detail():
     for tool, start, end, used, current in planned:
         if tool not in events:
             # Grok 没有带时间戳的事件缓存,只能靠账本的 hours。
-            events[tool] = (_quota_claude_events(cache) if tool == "claude"
+            events[tool] = (_quota_claude_events(cache, "claude_desktop")
+                            if tool == "claude_desktop"
                             else _quota_codex_events(codex_spans, cache) if tool == "codex"
                             else None)
         tokens, per_device, approx = _quota_window_tokens(
@@ -15169,6 +15616,7 @@ def dashboard():
 _PROJECT_SOURCES = (
     # tool_key,      显示名,            记成本, session, token 计数
     ("claude",       "Claude",          True,  "entry", "token_total"),
+    ("claude_desktop", "Claude Code Desktop", True, "entry", "token_total"),
     ("codex",        "Codex",           True,  "entry", "token_total"),
     ("pi",           "Pi",              True,  "entry", "token_total"),
     ("prime_agent",  "Prime Agent",     True,  "entry", "token_total"),
@@ -15367,6 +15815,28 @@ def build_projects(refresh=True):
         result.append(entry)
     result.sort(key=lambda x: x["last_active"], reverse=True)
     return result
+
+
+def _format_model_effort_details(model_efforts):
+    """Flatten per-model effort counters and merge raw aliases into display rows."""
+    grouped = {}
+    fields = ("in", "out", "cr", "cw", "cached", "reason", "thoughts")
+    for model, efforts in (model_efforts or {}).items():
+        model_id = _model_identity_id(model)
+        if not isinstance(efforts, dict):
+            continue
+        for effort, usage in efforts.items():
+            if not isinstance(usage, dict):
+                continue
+            key = (model_id, str(effort or "未记录"))
+            row = grouped.setdefault(key, {"model_id": model_id,
+                                           "name": nice_model(model_id),
+                                           "effort": key[1]})
+            for field in fields:
+                row[field] = row.get(field, 0) + int(usage.get(field, 0) or 0)
+    return sorted(grouped.values(), key=lambda row: (
+        -sum(row.get(field, 0) for field in ("in", "out", "cr", "cw", "cached")),
+        row["name"].casefold(), row["effort"].casefold()))
 
 
 def projects():

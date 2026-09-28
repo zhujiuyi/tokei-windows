@@ -20,6 +20,8 @@ from .paths import log_path, settings_path
 
 PROVIDERS = [
     ("claude", "Claude Code", "#eb8566"),
+    # 官方通道(订阅/官方 API):中继通道没有订阅计划,额度条只挂这张卡片。
+    ("claude_desktop", "Claude Code Desktop", "#f2b06a"),
     ("codex", "Codex CLI", "#6babfa"),
     ("gemini", "Gemini / Antigravity", "#9e85eb"),
     ("cursor", "Cursor", "#b8c4e6"),
@@ -75,6 +77,113 @@ def _integer(value: Any) -> int:
 
 def _format_integer(value: Any) -> str:
     return f"{_integer(value):,}"
+
+
+def _provider_token_total(value: dict[str, Any], provider: str) -> int:
+    fields = ("in", "out", "cached", "cr", "cw", "reason")
+    if provider in {"codex", "openclaw", "musecode"}:
+        fields = tuple(field for field in fields if field != "reason")
+    return sum(_integer(value.get(field)) for field in fields)
+
+
+def _card_model_details(today: dict[str, Any], provider: str) -> list[dict[str, Any]]:
+    """Normalize model and model-effort counters for the overview card dialog."""
+    fields = ("in", "cached_read", "cache_write", "out", "reason")
+    reason_is_output_subset = provider in {"codex", "openclaw", "musecode"}
+
+    def normalized(source: dict[str, Any], name: str, effort: str) -> dict[str, Any]:
+        cache_read = source.get(
+            "cr", source.get("cached", source.get("cached_read", source.get("cache_read", 0))))
+        reason = _integer(source.get("reason", 0)) + _integer(source.get("thoughts", 0))
+        result = {
+            "name": name or "未知模型",
+            "effort": effort or "未记录",
+            "in": _integer(source.get("in", 0)),
+            "cached_read": _integer(cache_read),
+            "cache_write": _integer(source.get("cw", source.get("cache_write", 0))),
+            "out": _integer(source.get("out", 0)),
+            "reason": reason,
+        }
+        explicit_total = source.get("tokens", source.get("token_count", source.get("total")))
+        if explicit_total is not None:
+            result["tokens"] = _integer(explicit_total)
+        else:
+            result["tokens"] = sum(result[key] for key in ("in", "cached_read", "cache_write", "out"))
+            if not reason_is_output_subset:
+                result["tokens"] += reason
+        return result
+
+    def entries(value: Any) -> list[tuple[str, dict[str, Any]]]:
+        if isinstance(value, list):
+            return [
+                (str(item.get("name") or item.get("model_id") or "未知模型"), item)
+                for item in value if isinstance(item, dict)
+            ]
+        if isinstance(value, dict):
+            return [
+                (str(name or "未知模型"), usage if isinstance(usage, dict) else {"tokens": usage})
+                for name, usage in value.items()
+            ]
+        return []
+
+    models: dict[str, dict[str, Any]] = {}
+    for name, usage in entries(today.get("models")):
+        row = normalized(usage, name, "未记录")
+        key = name.casefold()
+        current = models.get(key)
+        if current is None:
+            models[key] = row
+        else:
+            for field in (*fields, "tokens"):
+                current[field] += row[field]
+
+    effort_rows: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in today.get("model_efforts") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("model_id") or "未知模型")
+        effort = str(item.get("effort") or "未记录")
+        row = normalized(item, name, effort)
+        key = (name.casefold(), effort)
+        current = effort_rows.get(key)
+        if current is None:
+            effort_rows[key] = row
+        else:
+            for field in (*fields, "tokens"):
+                current[field] += row[field]
+
+    by_model: dict[str, list[dict[str, Any]]] = {}
+    for (model_key, _), row in effort_rows.items():
+        by_model.setdefault(model_key, []).append(row)
+
+    for model_key, model in models.items():
+        attributed = by_model.get(model_key, [])
+        if not attributed:
+            key = (model_key, "未记录")
+            effort_rows[key] = model
+            continue
+        remainder = {field: max(0, model[field] - sum(row[field] for row in attributed))
+                     for field in fields}
+        token_remainder = max(0, model["tokens"] - sum(row["tokens"] for row in attributed))
+        if any(remainder.values()) or token_remainder:
+            fallback = normalized(remainder, model["name"], "未记录")
+            fallback["tokens"] = token_remainder
+            effort_rows[(model_key, "未记录")] = fallback
+
+    rows = sorted(effort_rows.values(), key=lambda row: (
+        -row["tokens"], row["name"].casefold(), row["effort"].casefold()))
+    display_rows = []
+    for row in rows:
+        display_rows.append({
+            "name": row["name"], "effort": row["effort"],
+            "tokens_display": _format_integer(row["tokens"]),
+            "in_display": _format_integer(row["in"]),
+            "cached_read_display": _format_integer(row["cached_read"]),
+            "cache_write_display": _format_integer(row["cache_write"]),
+            "out_display": _format_integer(row["out"]),
+            "reason_display": _format_integer(row["reason"]),
+        })
+    return display_rows
 
 
 def _normalize_refresh_seconds(value: Any) -> int:
@@ -199,7 +308,7 @@ class _RefreshJob(QRunnable):
             usage = collector.compute()
             dashboard = collector.build_dashboard(self.period)
             cost_fields = (
-                "claude", "codex", "codex_reserve", "gemini", "grok", "zcode",
+                "claude", "claude_desktop", "codex", "codex_reserve", "gemini", "grok", "zcode",
                 "mimocode", "devin", "pi", "workbuddy", "workbuddy_ai",
                 "codebuddy", "deepseek_harness", "opencode", "qwencode",
                 "kimicode", "musecode", "cmdcode", "prime_agent", "hermes", "openclaw",
@@ -547,7 +656,7 @@ class Store(QObject):
                 continue
             selected_range = self._settings.get("card_period", "today")
             today = ((data.get("ranges") or {}).get(selected_range) or {})
-            total_tokens = sum(_integer(today.get(field)) for field in ("in", "out", "cached", "cr", "cw", "reason"))
+            total_tokens = _provider_token_total(today, key)
             quota = data.get("quota") if isinstance(data.get("quota"), dict) else data
             metrics = []
             for name in ("in", "out", "cached", "cr", "cw", "reason", "sessions", "calls", "tasks", "cost", "cost_cny", "credits"):
@@ -560,11 +669,11 @@ class Store(QObject):
                     display = f"{_number(value):,.1f}"
                 metrics.append({"label": label, "value": display})
             quotas = []
-            if key == "claude":
-                for field, label in (("q5", "5 小时"), ("q7", "周额度"), ("qf", "Opus")):
+            if key == "claude_desktop":
+                for field, label in (("q5", "5 小时"), ("q7", "周额度"), ("qf", "Fable 周")):
                     value = data.get(field)
                     if value is not None:
-                        quotas.append({"label": label, "used": max(0, min(100, 100 - _number(value))), "remaining": _number(value), "stale": bool(data.get(f"{field}_stale"))})
+                        quotas.append({"label": label, "used": max(0, min(100, _number(value))), "remaining": max(0, 100 - _number(value)), "stale": bool(data.get(f"{field}_stale"))})
             elif key == "codex":
                 for field, label in (("p5", "5 小时"), ("pw", "周额度")):
                     value = data.get(field)
@@ -587,7 +696,8 @@ class Store(QObject):
                           "total_tokens": total_tokens,
                           "total_tokens_display": _format_integer(total_tokens),
                           "totalTokensDisplay": _format_integer(total_tokens),
-                          "status": status, "metrics": metrics[:6], "quotas": quotas[:3]})
+                          "status": status, "metrics": metrics[:6], "quotas": quotas[:3],
+                          "model_details": _card_model_details(today, key)})
         return cards
 
     def _make_summary(self) -> str:
@@ -596,7 +706,7 @@ class Store(QObject):
         for key, _, _ in PROVIDERS:
             provider = self._snapshot.get(key, {})
             today = ((provider.get("ranges") or {}).get("today") or {}) if isinstance(provider, dict) else {}
-            total_tokens += sum(_number(today.get(field)) for field in ("in", "out", "cached", "cr", "cw", "reason"))
+            total_tokens += _provider_token_total(today, key)
             total_cost += _number(today.get("cost"))
         codex = self._snapshot.get("codex") or {}
         p5, pw = codex.get("p5"), codex.get("pw")

@@ -6,13 +6,13 @@ import QtQuick.Controls
 ComboBox {
     id: control
 
-    palette.text: "#e6e6ea"
+    palette.text: "#e6ebf3"
 
     contentItem: Text {
         leftPadding: 10
         rightPadding: 34
         text: control.displayText
-        color: "#e6e6ea"
+        color: "#e6ebf3"
         font.pixelSize: 11
         verticalAlignment: Text.AlignVCenter
         elide: Text.ElideRight
@@ -37,7 +37,7 @@ ComboBox {
                 context.moveTo(2, 2)
                 context.lineTo(width / 2, height - 2)
                 context.lineTo(width - 2, 2)
-                context.strokeStyle = "#a6a7b0"
+                context.strokeStyle = "#a5afbe"
                 context.lineWidth = 1.5
                 context.lineCap = "round"
                 context.lineJoin = "round"
@@ -58,15 +58,15 @@ ComboBox {
         contentItem: Text {
             text: optionDelegate.text
             leftPadding: 10
-            color: "#e6e6ea"
+            color: "#e6ebf3"
             font.pixelSize: 11
             verticalAlignment: Text.AlignVCenter
             elide: Text.ElideRight
         }
 
         background: Rectangle {
-            radius: 5
-            color: optionDelegate.highlighted ? "#473435" : optionDelegate.hovered ? "#34353d" : "transparent"
+            radius: 7
+            color: optionDelegate.highlighted ? "#293444" : optionDelegate.hovered ? "#252b35" : "transparent"
         }
     }
 
@@ -75,6 +75,8 @@ ComboBox {
         width: control.width
         padding: 4
         implicitHeight: Math.min(contentItem.implicitHeight + padding * 2, 224)
+        enter: Transition { NumberAnimation { property: "opacity"; from: 0; to: 1; duration: 120; easing.type: Easing.OutCubic } }
+        exit: Transition { NumberAnimation { property: "opacity"; from: 1; to: 0; duration: 90; easing.type: Easing.InCubic } }
 
         contentItem: ListView {
             clip: true
@@ -85,16 +87,18 @@ ComboBox {
         }
 
         background: Rectangle {
-            color: "#25262d"
-            border.color: "#555660"
-            radius: 8
+            color: "#1b2028"
+            border.color: "#343c49"
+            radius: 10
         }
     }
 
     background: Rectangle {
-        radius: 8
-        color: control.down ? "#32333b" : "#2c2d34"
-        border.color: control.activeFocus ? "#a75c4b" : "#464750"
+        radius: 10
+        color: control.down ? "#252b35" : control.hovered ? "#242a34" : "#20252e"
+        border.color: control.activeFocus ? "#86aef0" : control.hovered ? "#465365" : "#343c49"
         border.width: control.activeFocus ? 1.3 : 1
+        Behavior on color { ColorAnimation { duration: 140; easing.type: Easing.OutCubic } }
+        Behavior on border.color { ColorAnimation { duration: 160; easing.type: Easing.OutCubic } }
     }
 }
