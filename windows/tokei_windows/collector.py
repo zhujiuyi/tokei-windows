@@ -783,7 +783,7 @@ _SCAN_CACHE_FILE = _DEFAULT_SCAN_CACHE_FILE
 _SCAN_CACHE_VERSION = 21
 _SCAN_CACHE_MIGRATABLE_VERSION = 19
 _CODEX_EVENT_CACHE_SUFFIX = ".codex-events"
-_CLAUDE_PARSER_VERSION = 3
+_CLAUDE_PARSER_VERSION = 4
 _CODEX_PARSER_VERSION = 9
 _CODEX_ACCOUNTING_VERSION = 7
 
@@ -1735,15 +1735,34 @@ def _dedupe_claude_events(file_events):
     return selected
 
 
-# 两个渠道:键 = 扫描缓存命名空间 + 账本工具键;值 = 是否官方通道(见 _claude_usage 的 official)。
-# claude 用中继/第三方 API(如 OpenCode);claude_desktop 走官方通道,订阅额度读数挂在它上面。
+# 两个卡片命名空间按「客户端」划分(键 = 扫描缓存命名空间 + 账本工具键;值 = 是否桌面客户端):
+#   claude          —— 非桌面客户端(cli / sdk-cli 等,任意计费渠道)
+#   claude_desktop  —— Claude 桌面客户端(官方 + 第三方;未登录时经第三方 API 出网也算它)
+# 计费渠道另由事件上的 official 表示,只服务订阅额度,不参与卡片归属。
 _CLAUDE_CHANNELS = (("claude", False), ("claude_desktop", True))
+# 订阅额度口径的派生视图:官方通道事件。客户端归属与计费渠道是正交的两个维度,
+# 所以它既属于某张卡片、又单独进这个命名空间,只被额度历史读取。
+_QUOTA_CACHE_KEY = "claude_official"
+_CLAUDE_NAMESPACES = tuple(key for key, _desktop in _CLAUDE_CHANNELS) + (_QUOTA_CACHE_KEY,)
+# 账本里只作「视图」存在的工具键:它们的数据已随所属工具的账本天计入,
+# 泛化遍历账本的地方(趋势/年度回顾)必须跳过,否则同一份额会被算两遍。
+_LEDGER_VIEW_ONLY_TOOLS = frozenset({_QUOTA_CACHE_KEY})
+# 桌面客户端的入口前缀(claude-desktop / claude-desktop-3p;将来的新变体自动命中)。
+_CLAUDE_DESKTOP_ENTRYPOINT = "claude-desktop"
 
-# 账本一次性迁移:把 claude 里官方通道的存量份额挪到 claude_desktop。
+
+def _claude_desktop_client(entrypoint):
+    """事件是否来自 Claude 桌面客户端。归属只认客户端,与出网渠道(官方/中继)无关。"""
+    return isinstance(entrypoint, str) and entrypoint.startswith(_CLAUDE_DESKTOP_ENTRYPOINT)
+
+# 账本一次性迁移。代次说明:
+#   gen 2(2026-09-28):把 claude 里官方通道的存量份额挪到 claude_desktop(那时命名空间按渠道分)。
+#   gen 3(2026-09-29):命名空间改按客户端分,把桌面客户端的份额(官方之外的部分)再挪一次;
+#                      若磁盘标记缺失(9-28 之前的混合账本),则整块搬走桌面份额。
 # 该值同时是迁移代次 id(落盘键为 claude_split)。降级陷阱:拆分前的旧构建再跑这份账本时,
-# claude 的实时混合值会在高水位合并里胜出,而 claude_desktop 仍带着官方份额 —— 两页会
+# claude 的实时混合值会在高水位合并里胜出,而 claude_desktop 仍带着桌面份额 —— 两页会
 # 重复计数;要重跑迁移,须先从 ~/.tokei/ledger.json 删掉 claude_split 键。
-_CLAUDE_SPLIT_MIGRATION = 2
+_CLAUDE_SPLIT_MIGRATION = 3
 
 
 def _claude_empty_ranges():
@@ -1845,6 +1864,22 @@ def _claude_live_days(fc, classify, bucket):
     return live_days
 
 
+def _claude_subset_live_days(fc, keep, classify, bucket):
+    """某命名空间里满足 keep(event) 的事件 → 逐日实测(迁移载荷用,不写回缓存)。
+
+    直接过滤事件而不复用条目里的 days:迁移要的是子集的口径,条目聚合是整个命名空间的。
+    """
+    subset = {}
+    for path, entry in fc.items():
+        events = [event for event in entry.get("events", []) if keep(event)]
+        if events:
+            subset[path] = {"proj": entry.get("proj"), "events": events}
+    if not subset:
+        return {}
+    _claude_refresh_aggregates(subset)
+    return _claude_live_days(subset, classify, bucket)
+
+
 def _claude_channel_into(bucket, tool, fc, live_days, classify):
     """把某渠道经账本对账后的按日值写进 range 桶。"""
     for dk, day in ledger_reconcile(tool, live_days, _ledger_file_sources(
@@ -1891,19 +1926,24 @@ def _claude_scan_result(buckets, curs):
             "desktop_cur": curs.get("claude_desktop") or dict(empty)}
 
 
-def _migrate_claude_ledger_split(desktop_days):
-    """一次性迁移:从旧混合存档的 claude 里减掉官方通道份额。
+def _migrate_claude_ledger_split(desktop_days, desktop_relay_days):
+    """一次性迁移:把 claude 里的桌面客户端份额挪到 claude_desktop。
 
-    桌面份额用本次扫描的实测值逐日相减;减法走 _ledger_values(..., subtract=True) ——
+    载荷按存量代次选:
+    - 磁盘标记为 2(gen 2 那次已减过官方份额)→ 只减桌面客户端的非官方份额(desktop_relay_days);
+    - 标记缺失(9-28 之前的混合账本)→ 整块减掉桌面份额(desktop_days)。
+
+    份额用本次扫描的实测值逐日相减;减法走 _ledger_values(..., subtract=True) ——
     它会跳过 _sources,于是被改过的天退化为「聚合 + 残差」,随后的正常对账按现存日志
-    重建来源。日志已被清理的天扫不到实测值,份额减不掉,保留在中继渠道(已知偏差)。
+    重建来源。日志已被清理的天扫不到实测值,份额减不掉,保留在 claude(已知偏差)。
     直接改磁盘并让内存缓存失效,避免 flush 时旧来源把减掉的量又合并回来。
-    hours/model_efforts 由键并集原样保留(不按残差重建),所以迁移当天中继渠道的
-    按小时/按 effort 明细仍含官方份额;天与按模型的 token 数是对的。
+    hours/model_efforts 由键并集原样保留(不按残差重建),所以迁移当天 claude 的
+    按小时/按 effort 明细仍含桌面份额;天与按模型的 token 数是对的。
     """
-    if not desktop_days:
+    previous = _load_ledger().get("claude_split")
+    if previous == _CLAUDE_SPLIT_MIGRATION:
         return False
-    if _load_ledger().get("claude_split") == _CLAUDE_SPLIT_MIGRATION:
+    if not (desktop_relay_days if previous == 2 else desktop_days):
         return False
     lock_fd = None
     lock_kind = None
@@ -1929,14 +1969,19 @@ def _migrate_claude_ledger_split(desktop_days):
             return False
         if fresh.get("claude_split") == _CLAUDE_SPLIT_MIGRATION:
             return False
+        # 锁内重新判一次代次:等锁期间别的进程可能已经迁完了。
+        payload_days = (desktop_relay_days if fresh.get("claude_split") == 2
+                        else desktop_days)
+        if not payload_days:
+            return False
         days = fresh.setdefault("tools", {}).setdefault("claude", {})
-        for dk, desktop_day in desktop_days.items():
+        for dk, share in payload_days.items():
             stored = days.get(dk)
             if not isinstance(stored, dict):
                 continue
-            payload = {field: desktop_day.get(field, 0)
+            payload = {field: share.get(field, 0)
                        for field in ("in", "out", "cr", "cw", "cost")}
-            payload["models"] = desktop_day.get("models") or {}
+            payload["models"] = share.get("models") or {}
             days[dk] = _ledger_values(stored, payload, subtract=True)
         fresh["claude_split"] = _CLAUDE_SPLIT_MIGRATION
         _save_ledger(fresh)
@@ -1952,13 +1997,14 @@ def _migrate_claude_ledger_split(desktop_days):
 
 
 def scan_claude(bounds, cache):
-    """Claude 一次解析,按响应特征拆成两个渠道。
+    """Claude 一次解析,按客户端拆成三个命名空间。
 
-    - claude        —— 中继/第三方 API 通道(如 OpenCode)
-    - claude_desktop —— 官方通道(订阅/官方 API);订阅额度读数挂在它上面
-    分类只看每条记录自身特征(_claude_usage 的 official),与入口(entrypoint)无关。
+    - claude          —— 非桌面客户端(cli / sdk-cli 等;任意计费渠道)
+    - claude_desktop  —— Claude 桌面客户端的全部用量(官方 + 第三方 API)
+    - claude_official —— 官方通道事件(订阅额度口径的派生视图,不进任何卡片)
+    归属只看事件自身的 entrypoint(_claude_desktop_client),与出网渠道无关。
     """
-    file_caches = {key: cache.setdefault(key, {}) for key, _official in _CLAUDE_CHANNELS}
+    file_caches = {key: cache.setdefault(key, {}) for key in _CLAUDE_NAMESPACES}
     # 与渠道无关的「已解析」索引:{文件: [签名, 解析器版本]}。渠道条目只在有事件时存在,
     # 所以两个渠道都没事件的文件(空会话)必须靠这份索引才不会每轮重读。
     parse_sigs = cache.setdefault("_claude_parse_sigs", {})
@@ -1968,7 +2014,7 @@ def scan_claude(bounds, cache):
         for fc in file_caches.values():
             if _reprice_claude_events(fc, changed_models):
                 changed = True
-    buckets = {key: _claude_empty_ranges() for key, _official in _CLAUDE_CHANNELS}
+    buckets = {key: _claude_empty_ranges() for key in _CLAUDE_NAMESPACES}
     cur_file, cur_mtime = None, -1.0
     if not os.path.isdir(CLAUDE_DIR):
         for fc in file_caches.values():
@@ -2030,24 +2076,29 @@ def scan_claude(bounds, cache):
                             "request_id": u.get("request_id"), "event_id": u.get("event_id"),
                             "sidechain": bool(u.get("sidechain")), "timestamp": u["dt"].isoformat(),
                             "line": line_number, "official": u.get("official") is True,
+                            "entrypoint": u.get("entrypoint"),
                         })
                         if proj is None and u.get("cwd"):
                             proj = u["cwd"]
             except OSError:
                 continue
-            split = {}
-            for official in (False, True):
-                own = [event for event in events if event.get("official") is official]
-                if own:
-                    split[official] = [event for _source, event in
-                                       _dedupe_claude_events((f, item) for item in own)]
-            for key, official in _CLAUDE_CHANNELS:
-                own = split.get(official)
+            groups = {key: [] for key in _CLAUDE_NAMESPACES}
+            for event in events:
+                desktop = _claude_desktop_client(event.get("entrypoint"))
+                for key, is_desktop in _CLAUDE_CHANNELS:
+                    if is_desktop is desktop:
+                        groups[key].append(event)
+                if event.get("official"):
+                    groups[_QUOTA_CACHE_KEY].append(event)
+            for key in _CLAUDE_NAMESPACES:
+                own = groups[key]
+                own = [event for _source, event in
+                       _dedupe_claude_events((f, item) for item in own)] if own else []
                 if own:
                     file_caches[key][f] = {"sig": sig, "events": own, "proj": proj,
                                            "parser_version": _CLAUDE_PARSER_VERSION}
                 else:
-                    # 该渠道在本文件无事件:不留空条目(已有条目要删除)。
+                    # 该命名空间在本文件无事件:不留空条目(已有条目要删除)。
                     file_caches[key].pop(f, None)
             parse_sigs[f] = [sig, _CLAUDE_PARSER_VERSION]
             changed = True
@@ -2077,12 +2128,17 @@ def scan_claude(bounds, cache):
         return ks
 
     live = {key: _claude_live_days(file_caches[key], classify, buckets[key])
-            for key, _official in _CLAUDE_CHANNELS}
-    _migrate_claude_ledger_split(live["claude_desktop"])
-    for key, _official in _CLAUDE_CHANNELS:
+            for key in _CLAUDE_NAMESPACES}
+    if _load_ledger().get("claude_split") != _CLAUDE_SPLIT_MIGRATION:
+        # 迁移只在未迁完时算载荷:桌面客户端的非官方份额要逐事件过滤,不该每轮都算。
+        desktop_relay_days = _claude_subset_live_days(
+            file_caches["claude_desktop"], lambda event: not event.get("official"),
+            classify, _claude_empty_ranges())
+        _migrate_claude_ledger_split(live["claude_desktop"], desktop_relay_days)
+    for key in _CLAUDE_NAMESPACES:
         _claude_channel_into(buckets[key], key, file_caches[key], live[key], classify)
     curs = {key: _claude_current_session(file_caches[key], cur_file)
-            for key, _official in _CLAUDE_CHANNELS}
+            for key, _desktop in _CLAUDE_CHANNELS}
     return _claude_scan_result(buckets, curs)
 
 
@@ -2119,8 +2175,11 @@ def _claude_usage(line, want_dt=False):
            "model": model, "cwd": o.get("cwd"), "mid": mid,
            "request_id": request_id,
            "event_id": o.get("uuid"), "sidechain": o.get("isSidechain") is True,
+           # 客户端归属看入口(供 scan_claude 分命名空间),与计费渠道无关。
+           "entrypoint": o.get("entrypoint"),
            # 官方通道(订阅/官方 API)的响应特征:Claude 自家消息 id + 请求 id + claude-* 模型,
            # 三者缺一即视为经中继/第三方 API 消耗(如 OpenCode),不计入订阅额度。
+           # 只服务额度口径,不参与卡片归属。
            "official": bool(isinstance(mid, str) and mid.startswith("msg_")
                             and isinstance(request_id, str) and request_id.startswith("req_")
                             and isinstance(model, str) and model.startswith("claude-"))}
@@ -14351,6 +14410,9 @@ def build_daily_costs(period="all", refresh=True, _cache=None):
         "mimocode", "devin", "pi", "workbuddy", "workbuddy_ai", "codebuddy", "deepseek_harness",
         "opencode", "qwencode", "musecode", "cmdcode"))
     for tool, tool_days in _load_ledger().get("tools", {}).items():
+        if tool in _LEDGER_VIEW_ONLY_TOOLS:
+            # 订阅口径的派生视图:份额已随所属工具的账本天计入
+            continue
         if not isinstance(tool_days, dict):
             continue
         column = tool if tool in _LEDGER_COST_COLUMNS else None
@@ -14922,6 +14984,9 @@ def build_wrapped(period="all", refresh=True, _cache=None):
     ledger_day_tokens = {}
     ledger_day_cost = {}
     for tool, tool_days in _load_ledger().get("tools", {}).items():
+        if tool in _LEDGER_VIEW_ONLY_TOOLS:
+            # 订阅口径的派生视图:份额已随所属工具的账本天计入
+            continue
         if not isinstance(tool_days, dict):
             continue
         for dk, day in tool_days.items():
@@ -15107,10 +15172,13 @@ _QUOTA_ANCHOR_FILE = os.path.join(HOME, ".tokei", "quota_cycles.json")
 _QUOTA_ANCHOR_JITTER = 120
 _QUOTA_CYCLE_MIN_USED_PCT = 2
 # 有周额度窗口的三个工具 → 日表里的短键。
-# 订阅额度属于官方通道:工具键是 claude_desktop,不是混合口径的 claude。
+# 工具键仍叫 claude_desktop(锚点文件、peer 读数键都用它),但账本日表要读
+# claude_official —— 官方通道口径,见 _QUOTA_LEDGER_KEY。
 _QUOTA_TOOLS = (("claude_desktop", "cd"), ("codex", "x"), ("grok", "g"))
 # 旧版本 peer 的额度读数与锚点还挂在 claude 键上,读到要认。
 _QUOTA_TOOL_ALIASES = {"claude": "claude_desktop"}
+# 额度工具键 → 账本工具键。桌面卡是客户端口径(含第三方),订阅周期只认官方通道。
+_QUOTA_LEDGER_KEY = {"claude_desktop": _QUOTA_CACHE_KEY}
 
 
 def _quota_local_day_range(day_key):
@@ -15164,7 +15232,7 @@ def _quota_day_tokens(tool, entry):
     if not isinstance(entry, dict):
         return 0
     if tool == "claude_desktop":
-        # T4 之前的 peer 账本日表是混合口径(中继+官方),归不到渠道,按规格一律不计。
+        # 订阅口径的日表来自 claude_official(官方通道);桌面卡那个键含第三方用量,不参与。
         return sum(int(entry.get(k, 0) or 0) for k in ("in", "out", "cr", "cw"))
     if tool == "codex":
         # 账本里的 codex "in" 已含 cached(与 ranges 相反,那边 in 是未缓存部分),
@@ -15179,7 +15247,8 @@ def _quota_daily_from_tools(tools):
     """账本日表 → {日: {"cd": …, "x": …, "g": …}}。"""
     out = {}
     for tool, key in _QUOTA_TOOLS:
-        for day, entry in (tools.get(tool) or {}).items():
+        ledger_days = tools.get(_QUOTA_LEDGER_KEY.get(tool, tool)) or {}
+        for day, entry in ledger_days.items():
             if isinstance(entry, dict):
                 out.setdefault(day, {k: 0 for _t, k in _QUOTA_TOOLS})[key] = \
                     _quota_day_tokens(tool, entry)
@@ -15217,8 +15286,12 @@ def _quota_day_hour_bounds(day_key, start, end):
     return lo_hour, max(hi_hour, lo_hour + 1)
 
 
-def _quota_claude_events(cache=None, cache_key="claude_desktop"):
-    """去重后的 Claude 事件 → [(epoch, 本地日, tokens)]。去重逻辑与 scan_claude 一致。"""
+def _quota_claude_events(cache=None, cache_key=_QUOTA_CACHE_KEY):
+    """去重后的 Claude 事件 → [(epoch, 本地日, tokens)]。去重逻辑与 scan_claude 一致。
+
+    默认读订阅额度专用的官方命名空间(见 scan_claude 的 claude_official):
+    桌面卡那个命名空间含第三方用量,不能当订阅用量。
+    """
     file_cache = (cache if cache is not None else _load_scan_cache()).get(cache_key) or {}
     all_events = []
     for path, entry in file_cache.items():
@@ -15551,7 +15624,7 @@ def build_quota_detail():
     for tool, start, end, used, current in planned:
         if tool not in events:
             # Grok 没有带时间戳的事件缓存,只能靠账本的 hours。
-            events[tool] = (_quota_claude_events(cache, "claude_desktop")
+            events[tool] = (_quota_claude_events(cache)
                             if tool == "claude_desktop"
                             else _quota_codex_events(codex_spans, cache) if tool == "codex"
                             else None)

@@ -1,5 +1,10 @@
 # Claude 渠道拆分设计：API 通道 / 官方订阅
 
+> **2026-09-29 修订**：本文档 §3 的分类判据（按响应特征分渠道）与 §4.4 的额度事件源已被
+> `2026-09-29-claude-client-attribution-design.md` 取代 —— Claude 用量改按**客户端**归属
+> （桌面客户端全部用量进 `claude_desktop`），额度周期另立账本键 `claude_official` 只认官方通道。
+> 本文档其余部分（缓存双命名空间、账本迁移机制、界面口径）仍然有效。
+
 - 日期：2026-09-28
 - 状态：设计已与用户逐节确认（第一部分数据层 / 第二部分各页面输出 / 第三部分界面与测试）；本文档待用户复核后转实施计划
 - 影响模块：`windows/tokei_windows/collector.py`、`windows/tokei_windows/bridge.py`、`windows/tokei_windows/qml/*`、`windows/tests/test_windows_client.py`

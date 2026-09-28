@@ -263,8 +263,8 @@ class _ClaudeChannelFixture(unittest.TestCase):
 
     @staticmethod
     def _assistant(inp, out, mid="msg_01XYZ", request_id="req_01ABC",
-                   model="claude-opus-5-5") -> dict:
-        record = {"type": "assistant", "cwd": "E:\\proj",
+                   model="claude-opus-5-5", entrypoint="claude-desktop") -> dict:
+        record = {"type": "assistant", "cwd": "E:\\proj", "entrypoint": entrypoint,
                   "timestamp": datetime.now().astimezone().isoformat(),
                   "message": {"id": mid, "model": model,
                               "usage": {"input_tokens": inp, "output_tokens": out}}}
@@ -278,7 +278,8 @@ class ClaudeChannelScanTests(_ClaudeChannelFixture):
         self._write("desktop.jsonl", [self._assistant(100, 50)])
         self._write("relay.jsonl", [self._assistant(10, 5, mid="9749d2b1c0",
                                                     request_id=None,
-                                                    model="deepseek-v4.1-flash")])
+                                                    model="deepseek-v4.1-flash",
+                                                    entrypoint="sdk-cli")])
         cache = collector._load_scan_cache()
         result = collector.scan_claude(collector.range_bounds(), cache)
         today, desktop = result["ranges"]["today"], result["desktop_ranges"]["today"]
@@ -297,10 +298,46 @@ class ClaudeChannelScanTests(_ClaudeChannelFixture):
         # cur / desktop_cur 只服务 collector 的命令行输出(界面不读),这里只查结构
         self.assertEqual(sorted(result["desktop_cur"]), ["cr", "cw", "in", "name", "out"])
 
+    def test_desktop_client_relay_usage_lands_in_the_desktop_namespace(self) -> None:
+        """未登录的桌面客户端经第三方 API 出网:归属只看客户端,不看出网渠道。"""
+        self._write("desktop-relay.jsonl", [
+            self._assistant(30, 7, mid="2f08dd23-4a33", request_id=None,
+                            model="deepseek-v4.1-flash", entrypoint="claude-desktop-3p")])
+        cache = collector._load_scan_cache()
+        result = collector.scan_claude(collector.range_bounds(), cache)
+        today = result["ranges"]["today"]
+        self.assertEqual((today["in"], today["out"]), (0, 0))
+        desktop = result["desktop_ranges"]["today"]
+        self.assertEqual((desktop["in"], desktop["out"]), (30, 7))
+        events = [event for entry in cache["claude_desktop"].values()
+                  for event in entry.get("events") or []]
+        self.assertEqual([event["entrypoint"] for event in events], ["claude-desktop-3p"])
+        self.assertNotIn("desktop-relay.jsonl",
+                         {os.path.basename(p) for p in cache["claude"]})
+
+    def test_official_namespace_holds_only_official_events(self) -> None:
+        """订阅额度口径的派生命名空间:只收 official,且是桌面卡数据的子集。"""
+        self._write("mixed.jsonl", [
+            self._assistant(100, 50),
+            self._assistant(30, 7, mid="2f08dd23-4a33", request_id=None,
+                            model="deepseek-v4.1-flash", entrypoint="claude-desktop-3p"),
+            self._assistant(9, 1, mid="9749d2b1c0", request_id=None,
+                            model="deepseek-v4.1-flash", entrypoint="sdk-cli")])
+        cache = collector._load_scan_cache()
+        collector.scan_claude(collector.range_bounds(), cache)
+        official = [event for entry in cache[collector._QUOTA_CACHE_KEY].values()
+                    for event in entry.get("events") or []]
+        self.assertEqual([event["model"] for event in official], ["claude-opus-5-5"])
+        self.assertTrue(all(event["official"] for event in official))
+        desktop = [event for entry in cache["claude_desktop"].values()
+                   for event in entry.get("events") or []]
+        self.assertEqual(sorted(event["in"] for event in desktop), [30, 100])
+
     def test_steady_state_scan_does_not_reparse(self) -> None:
         self._write("relay.jsonl", [self._assistant(10, 5, mid="9749d2b1c0",
                                                     request_id=None,
-                                                    model="deepseek-v4.1-flash")])
+                                                    model="deepseek-v4.1-flash",
+                                                    entrypoint="sdk-cli")])
         self._write("empty.jsonl", [])   # 两个渠道都没事件的文件同样不能再被重读
         cache = collector._load_scan_cache()
         collector.scan_claude(collector.range_bounds(), cache)
@@ -309,22 +346,30 @@ class ClaudeChannelScanTests(_ClaudeChannelFixture):
         self.assertFalse(cache.get("_dirty"))
         self.assertNotIn("empty.jsonl", {os.path.basename(p) for p in cache["claude"]})
         self.assertNotIn("empty.jsonl", {os.path.basename(p) for p in cache["claude_desktop"]})
+        self.assertNotIn("empty.jsonl",
+                         {os.path.basename(p) for p in cache[collector._QUOTA_CACHE_KEY]})
 
 
 class ClaudeLedgerSplitMigrationTests(_ClaudeChannelFixture):
+    """claude_split 2 → 3:把桌面客户端的份额(含第三方)从 claude 挪到 claude_desktop。
+
+    gen 2 已减过官方份额,所以从 marker=2 出发只减「桌面非官方」;
+    9-28 之前的混合账本(无标记)要整块减掉桌面份额。
+    """
+
     def setUp(self) -> None:
         super().setUp()
         self.day = datetime.now().astimezone().date().isoformat()
 
-    def _seed_mixed_ledger(self, desktop_in: int, relay_in: int) -> None:
-        """旧版账本:claude 的一天里混着中继与官方,且带按文件来源。"""
-        mixed = {"in": desktop_in + relay_in, "out": 0, "cr": 0, "cw": 0, "cost": 1.0,
-                 "models": {"claude-opus-5-5": {"in": desktop_in, "out": 0, "cr": 0,
-                                                "cw": 0, "cost": 1.0}},
-                 "_sources": {"legacy.jsonl": {"in": desktop_in + relay_in, "out": 0,
-                                               "cr": 0, "cw": 0, "cost": 1.0}}}
-        self.ledger_path.write_text(json.dumps({"v": 1, "tools": {"claude": {self.day: mixed}}}),
-                                    encoding="utf-8")
+    def _seed_ledger(self, claude_in: int, marker=None) -> None:
+        """存量账本:claude 的这一天含桌面客户端的份额。"""
+        day = {"in": claude_in, "out": 0, "cr": 0, "cw": 0, "cost": 1.0, "models": {},
+               "_sources": {"legacy.jsonl": {"in": claude_in, "out": 0, "cr": 0, "cw": 0,
+                                             "cost": 1.0}}}
+        ledger = {"v": 1, "tools": {"claude": {self.day: day}}}
+        if marker is not None:
+            ledger["claude_split"] = marker
+        self.ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
         collector._LEDGER_CACHE.update({"data": None, "dirty": False})
 
     def _scan_and_flush(self) -> dict:
@@ -333,64 +378,94 @@ class ClaudeLedgerSplitMigrationTests(_ClaudeChannelFixture):
         collector.ledger_flush()
         return json.loads(self.ledger_path.read_text(encoding="utf-8"))
 
-    def test_migration_moves_the_desktop_share_out_of_relay_ledger(self) -> None:
-        self._seed_mixed_ledger(desktop_in=90, relay_in=10)
-        self._write("desktop.jsonl", [self._assistant(90, 0)])
-        self._write("relay.jsonl", [self._assistant(10, 0, mid="9749d2b1c0",
-                                                    request_id=None,
-                                                    model="deepseek-v4.1-flash")])
+    def _write_desktop_client_relay(self, inp: int) -> None:
+        self._write("desktop-relay.jsonl", [
+            self._assistant(inp, 0, mid="2f08dd23-4a33", request_id=None,
+                            model="deepseek-v4.1-flash", entrypoint="claude-desktop-3p")])
+
+    def _write_cli_relay(self, inp: int) -> None:
+        self._write("relay.jsonl", [
+            self._assistant(inp, 0, mid="9749d2b1c0", request_id=None,
+                            model="deepseek-v4.1-flash", entrypoint="sdk-cli")])
+
+    def test_gen2_ledger_loses_only_the_desktop_relay_share(self) -> None:
+        self._seed_ledger(claude_in=40, marker=2)
+        self._write_desktop_client_relay(30)
+        self._write_cli_relay(10)
         stored = self._scan_and_flush()
-        self.assertEqual(stored["claude_split"], 2)
+        self.assertEqual(stored["claude_split"], 3)
+        self.assertEqual(stored["tools"]["claude"][self.day]["in"], 10)
+        self.assertEqual(stored["tools"]["claude_desktop"][self.day]["in"], 30)
+        # 这一天没有官方事件,订阅口径为空
+        self.assertNotIn(self.day, stored["tools"].get(collector._QUOTA_CACHE_KEY, {}))
+
+    def test_pre_split_ledger_loses_the_whole_desktop_share(self) -> None:
+        """9-28 之前的混合账本(无标记):官方 + 非官方一起搬走。"""
+        self._seed_ledger(claude_in=100)
+        self._write("desktop.jsonl", [self._assistant(90, 0)])
+        self._write_cli_relay(10)
+        stored = self._scan_and_flush()
+        self.assertEqual(stored["claude_split"], 3)
         self.assertEqual(stored["tools"]["claude"][self.day]["in"], 10)
         self.assertEqual(stored["tools"]["claude_desktop"][self.day]["in"], 90)
+        self.assertEqual(stored["tools"][collector._QUOTA_CACHE_KEY][self.day]["in"], 90)
 
     def test_migration_runs_once(self) -> None:
-        self._seed_mixed_ledger(desktop_in=90, relay_in=10)
-        self._write("desktop.jsonl", [self._assistant(90, 0)])
-        self._write("relay.jsonl", [self._assistant(10, 0, mid="9749d2b1c0",
-                                                    request_id=None,
-                                                    model="deepseek-v4.1-flash")])
+        self._seed_ledger(claude_in=40, marker=2)
+        self._write_desktop_client_relay(30)
+        self._write_cli_relay(10)
         self._scan_and_flush()
         stored = self._scan_and_flush()
         self.assertEqual(stored["tools"]["claude"][self.day]["in"], 10)
-        self.assertEqual(stored["tools"]["claude_desktop"][self.day]["in"], 90)
+        self.assertEqual(stored["tools"]["claude_desktop"][self.day]["in"], 30)
+
+    def test_migration_conserves_the_card_totals(self) -> None:
+        self._seed_ledger(claude_in=40, marker=2)
+        self._write_desktop_client_relay(30)
+        self._write_cli_relay(10)
+        stored = self._scan_and_flush()
+        cards = (stored["tools"]["claude"][self.day]["in"]
+                 + stored["tools"]["claude_desktop"][self.day]["in"])
+        self.assertEqual(cards, 40)
 
     def test_flush_of_a_stale_memo_does_not_resurrect_the_split(self) -> None:
-        """迁移前就载入账本的另一个进程(tray),其 flush 不能按旧来源把官方份额加回来。"""
-        desktop_days = {self.day: {"in": 90, "out": 0, "cr": 0, "cw": 0,
+        """迁移前就载入账本的另一个进程(tray),其 flush 不能按旧来源把桌面份额加回来。"""
+        desktop_days = {self.day: {"in": 30, "out": 0, "cr": 0, "cw": 0,
                                    "cost": 0.0, "models": {}}}
-        self._seed_mixed_ledger(desktop_in=90, relay_in=10)
+        desktop_relay_days = dict(desktop_days)
+        self._seed_ledger(claude_in=40, marker=2)
         stale_memo = collector._load_ledger()        # 另一个进程:迁移前载入的内存账本
-        stale_memo["tools"]["claude_desktop"] = dict(desktop_days)   # 它自己已对账出的官方天
-        collector._migrate_claude_ledger_split(desktop_days)
+        stale_memo["tools"]["claude_desktop"] = dict(desktop_days)
+        collector._migrate_claude_ledger_split(desktop_days, desktop_relay_days)
         collector._LEDGER_CACHE.update({"data": stale_memo, "dirty": True})  # 它随后落盘
         collector.ledger_flush()
         stored = json.loads(self.ledger_path.read_text(encoding="utf-8"))
-        self.assertEqual(stored["claude_split"], 2)
+        self.assertEqual(stored["claude_split"], 3)
         self.assertEqual(stored["tools"]["claude"][self.day]["in"], 10)
-        self.assertEqual(stored["tools"]["claude_desktop"][self.day]["in"], 90)
+        self.assertEqual(stored["tools"]["claude_desktop"][self.day]["in"], 30)
 
     def test_fresh_ledger_still_gets_the_migration_marker(self) -> None:
-        """全新装机(无账本文件)也必须落标记,否则下一轮会把官方份额从中继天里错减掉。"""
-        desktop_days = {self.day: {"in": 90, "out": 0, "cr": 0, "cw": 0,
+        """全新装机(无账本文件)也必须落标记,否则下一轮会把桌面份额从中继天里错减掉。"""
+        desktop_days = {self.day: {"in": 30, "out": 0, "cr": 0, "cw": 0,
                                    "cost": 0.0, "models": {}}}
         with patch.object(collector, "_load_tokei_config", lambda: {}):
             self.assertFalse(self.ledger_path.exists())
-            self.assertFalse(collector._migrate_claude_ledger_split({}))
-            self.assertFalse(self.ledger_path.exists())     # 空 desktop_days:早退,不写盘
-            self.assertTrue(collector._migrate_claude_ledger_split(desktop_days))
+            self.assertFalse(collector._migrate_claude_ledger_split({}, {}))
+            self.assertFalse(self.ledger_path.exists())     # 空载荷:早退,不写盘
+            self.assertTrue(collector._migrate_claude_ledger_split(desktop_days, desktop_days))
         stored = json.loads(self.ledger_path.read_text(encoding="utf-8"))
-        self.assertEqual(stored["claude_split"], 2)
+        self.assertEqual(stored["claude_split"], 3)
         self.assertEqual(stored["tools"]["claude"], {})     # 没有存量天可减
 
     def test_unreadable_ledger_is_neither_migrated_nor_overwritten(self) -> None:
         """账本在、但读不出来:不迁移、不落标记、不覆盖,下一轮再试。"""
-        desktop_days = {self.day: {"in": 90, "out": 0, "cr": 0, "cw": 0,
+        desktop_days = {self.day: {"in": 30, "out": 0, "cr": 0, "cw": 0,
                                    "cost": 0.0, "models": {}}}
         corrupt = '{"v": 1, "tools": {"claude": {'
         self.ledger_path.write_text(corrupt, encoding="utf-8")
         with patch.object(collector, "_load_tokei_config", lambda: {}):
-            self.assertFalse(collector._migrate_claude_ledger_split(desktop_days))
+            self.assertFalse(collector._migrate_claude_ledger_split(
+                desktop_days, dict(desktop_days)))
         self.assertEqual(self.ledger_path.read_text(encoding="utf-8"), corrupt)
 
 
@@ -420,16 +495,16 @@ class ClaudeQuotaChannelTests(unittest.TestCase):
         official = {"timestamp": datetime.fromtimestamp(now - 60).astimezone().isoformat(),
                     "in": 40, "out": 2, "cr": 3, "cw": 5}
         cache = {"claude": {"relay.jsonl": {"events": [relay]}},
-                 "claude_desktop": {"desktop.jsonl": {"events": [official]}}}
-        amounts = [amount for _ts, _day, amount
-                   in collector._quota_claude_events(cache, "claude_desktop")]
+                 "claude_desktop": {"desktop.jsonl": {"events": [official]}},
+                 collector._QUOTA_CACHE_KEY: {"official.jsonl": {"events": [official]}}}
+        amounts = [amount for _ts, _day, amount in collector._quota_claude_events(cache)]
         self.assertEqual(amounts, [50])
 
-    def test_only_the_desktop_ledger_feeds_the_claude_cycle(self) -> None:
-        """T4 之前的 peer 账本日表是混合口径(中继+官方),归不到任何渠道 → 一律不计。"""
+    def test_cycle_tokens_come_from_the_official_ledger_key(self) -> None:
+        """桌面卡的 claude_desktop 键是客户端全部用量,不能当订阅用量;订阅口径在 claude_official。"""
         day = {"2026-09-27": {"in": 100, "out": 5, "cr": 0, "cw": 0, "cost": 1.0}}
-        self.assertEqual(collector._quota_daily_from_tools({"claude": day}), {})
-        self.assertEqual(collector._quota_daily_from_tools({"claude_desktop": day}),
+        self.assertEqual(collector._quota_daily_from_tools({"claude_desktop": day}), {})
+        self.assertEqual(collector._quota_daily_from_tools({collector._QUOTA_CACHE_KEY: day}),
                          {"2026-09-27": {"cd": 105, "x": 0, "g": 0}})
 
 
@@ -505,6 +580,22 @@ class ClaudeChannelPagesTests(unittest.TestCase):
         self.assertEqual(desktop_rows[0]["label"], "Claude Code Desktop")
 
     def test_yearly_review_totals_include_the_desktop_channel(self) -> None:
+        wrapped = collector.build_wrapped("all", refresh=False, _cache=self._cache())
+        self.assertEqual(wrapped["total_tokens"], 111)
+
+    def test_official_view_is_not_counted_twice_in_pages(self) -> None:
+        """claude_official 是订阅口径的派生视图:趋势/回顾的总量不能再加一遍。"""
+        ledger = {"v": 1, "tools": {
+            "claude_desktop": {self.day: {"in": 90, "out": 3, "cr": 5, "cw": 0,
+                                          "cost": 2.0, "models": {}}},
+            collector._QUOTA_CACHE_KEY: {self.day: {"in": 90, "out": 3, "cr": 5, "cw": 0,
+                                                    "cost": 2.0, "models": {}}}}}
+        with open(collector._LEDGER_FILE, "w", encoding="utf-8") as fh:
+            json.dump(ledger, fh)
+        collector._LEDGER_CACHE.update({"data": None, "dirty": False})
+        result = collector.build_daily_costs("all", refresh=False, _cache=self._cache())
+        row = next(point for point in result["daily"] if point["date"] == self.day)
+        self.assertEqual(row["tokens"], 111)      # 13 + 98,派生视图不加倍
         wrapped = collector.build_wrapped("all", refresh=False, _cache=self._cache())
         self.assertEqual(wrapped["total_tokens"], 111)
 
