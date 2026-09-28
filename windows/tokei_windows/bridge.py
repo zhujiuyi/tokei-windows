@@ -61,6 +61,12 @@ LABELS = {
 }
 
 
+# 订阅读数(q5/q7/qf)取自 Claude 桌面端缓存里最近一次 /usage 响应。未登录时桌面端不再请求
+# /usage,读数会一直停在最后一次登录的时刻 —— 超过这个时长就当没有订阅,整块不渲染额度条
+# (卡片照常显示 token/成本);一天以内仍按原有的「已过期」标记显示。
+_CLAUDE_QUOTA_BAR_MAX_AGE = 24 * 3600
+
+
 def _number(value: Any) -> float:
     try:
         return float(value or 0)
@@ -670,9 +676,13 @@ class Store(QObject):
                 metrics.append({"label": label, "value": display})
             quotas = []
             if key == "claude_desktop":
+                # 读数缺时间戳时保守处理:确认不了新鲜度就不显示,免得把上次登录的数字当现状。
+                # -300 秒与 collector._claude_quota_with_freshness 的时钟抖动容忍一致。
+                quota_age = time.time() - _number(data.get("q_updated"))
+                show_quota = -300 <= quota_age <= _CLAUDE_QUOTA_BAR_MAX_AGE
                 for field, label in (("q5", "5 小时"), ("q7", "周额度"), ("qf", "Fable 周")):
                     value = data.get(field)
-                    if value is not None:
+                    if value is not None and show_quota:
                         quotas.append({"label": label, "used": max(0, min(100, _number(value))), "remaining": max(0, 100 - _number(value)), "stale": bool(data.get(f"{field}_stale"))})
             elif key == "codex":
                 for field, label in (("p5", "5 小时"), ("pw", "周额度")):

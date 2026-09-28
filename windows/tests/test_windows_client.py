@@ -661,6 +661,7 @@ class DashboardPresentationTests(unittest.TestCase):
                     "ranges": {"today": {"in": 1200, "cost": 0.18}},
                     "q5": 38.0,
                     "q5_stale": True,
+                    "q_updated": time.time(),
                 }
             },
             _settings={"card_period": "today"},
@@ -673,7 +674,8 @@ class DashboardPresentationTests(unittest.TestCase):
 
     def test_claude_quota_values_are_used_percentages(self) -> None:
         state = SimpleNamespace(
-            _snapshot={"claude_desktop": {"ranges": {"today": {}}, "q5": 10.0, "q7": 2.0, "qf": 40.0}},
+            _snapshot={"claude_desktop": {"ranges": {"today": {}}, "q5": 10.0, "q7": 2.0, "qf": 40.0,
+                                          "q_updated": time.time()}},
             _settings={"card_period": "today"},
         )
         cards = Store._build_cards(state)
@@ -683,6 +685,44 @@ class DashboardPresentationTests(unittest.TestCase):
             [("5 小时", 10.0, 90.0), ("周额度", 2.0, 98.0), ("Fable 周", 40.0, 60.0)],
         )
 
+    def test_desktop_quota_bars_hide_after_a_day_without_a_live_reading(self) -> None:
+        """未登录时桌面端不再刷新 /usage:读数超过一天就不再显示额度条,token 统计照常。"""
+        now = int(time.time())
+        recent = SimpleNamespace(
+            _snapshot={"claude_desktop": {"ranges": {"today": {"in": 1000}},
+                                          "q5": 39.0, "q7": 6.0,
+                                          "q5_stale": True, "q7_stale": True,
+                                          "q_updated": now - 2 * 3600}},
+            _settings={"card_period": "today"},
+        )
+        card = next(card for card in Store._build_cards(recent)
+                    if card["key"] == "claude_desktop")
+        self.assertEqual([quota["label"] for quota in card["quotas"]], ["5 小时", "周额度"])
+        self.assertTrue(all(quota["stale"] for quota in card["quotas"]))
+        self.assertEqual(card["metrics"][0]["value"], "1,000")
+
+        ancient = SimpleNamespace(
+            _snapshot={"claude_desktop": {"ranges": {"today": {"in": 1000}},
+                                          "q5": 39.0, "q7": 6.0,
+                                          "q_updated": now - 26 * 3600}},
+            _settings={"card_period": "today"},
+        )
+        card = next(card for card in Store._build_cards(ancient)
+                    if card["key"] == "claude_desktop")
+        self.assertEqual(card["quotas"], [])
+        self.assertEqual(card["status"], "有数据")
+        self.assertEqual(card["metrics"][0]["value"], "1,000")
+
+    def test_desktop_quota_bars_hide_when_the_reading_has_no_timestamp(self) -> None:
+        """读不到时间戳就无法确认新鲜度,同样不显示额度条。"""
+        state = SimpleNamespace(
+            _snapshot={"claude_desktop": {"ranges": {"today": {"in": 1000}}, "q5": 39.0}},
+            _settings={"card_period": "today"},
+        )
+        card = next(card for card in Store._build_cards(state)
+                    if card["key"] == "claude_desktop")
+        self.assertEqual(card["quotas"], [])
+
     def test_only_the_desktop_card_carries_subscription_bars(self) -> None:
         state = SimpleNamespace(
             _snapshot={
@@ -690,7 +730,7 @@ class DashboardPresentationTests(unittest.TestCase):
                 "claude": {"ranges": {"today": {"in": 1000, "out": 500, "cost": 0.12}},
                            "q5": 20.0, "q7": 3.0},
                 "claude_desktop": {"ranges": {"today": {"in": 2000, "out": 100, "cost": 0.30}},
-                                   "q5": 20.0, "q7": 3.0},
+                                   "q5": 20.0, "q7": 3.0, "q_updated": time.time()},
             },
             _settings={"card_period": "today"},
         )
